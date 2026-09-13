@@ -2,18 +2,33 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Query
 
 from . import database as db
-from .analysis import DEFAULT_THRESHOLDS, compute_metrics, evaluate, validate_samples
+from .analysis import (
+    DEFAULT_THRESHOLDS,
+    LEVELS,
+    aggregate_windows,
+    compute_metrics,
+    evaluate,
+    evaluate_window,
+    validate_samples,
+)
 from .errors import ApiError, register_error_handlers
 from .schemas import (
     AnalysisRequest,
     AnalysisResult,
+    Alarm,
+    AlarmAckRequest,
+    AlarmNoteRequest,
+    AlarmPage,
     RecordPage,
     SamplePage,
     ThresholdConfig,
+    WindowAnalysisRequest,
+    WindowAnalysisResult,
 )
 
 @asynccontextmanager
@@ -88,6 +103,126 @@ def replay_samples(
         raise ApiError(404, "RECORD_NOT_FOUND", f"分析记录 {record_id} 不存在")
     samples, total = db.get_samples(record_id, offset=offset, limit=limit)
     return {"record_id": record_id, "total": total, "offset": offset, "limit": limit, "samples": samples}
+
+
+# ---------- 时间窗 × 转速工况分析 ----------
+
+@app.post("/api/v1/windows/analysis", response_model=WindowAnalysisResult, status_code=201)
+def analyze_windows(req: WindowAnalysisRequest) -> dict:
+    """按时间窗与转速区间聚合带转速的样本，返回 RMS / 峰值 / 峭度等指标；越界窗口持久化告警。"""
+    th = db.get_threshold(req.equipment_id) or DEFAULT_THRESHOLDS
+    samples = [s.model_dump() for s in req.samples]
+
+    validate_samples(samples, int(th["min_samples"]))
+    windows = aggregate_windows(samples, req.window_seconds, req.rpm_bins)
+
+    reference_time = req.reference_time
+    if reference_time is None:
+        reference_time = datetime.now(timezone.utc)
+    elif reference_time.tzinfo is None:
+        reference_time = reference_time.replace(tzinfo=timezone.utc)
+    reference_iso = reference_time.astimezone(timezone.utc).isoformat()
+
+    min_samples = int(th["window_min_samples"])
+    overall_level = "normal"
+    alarm_count = 0
+    for w in windows:
+        if w["sample_count"] < min_samples:
+            w["evaluated"] = False
+            w["level"] = "insufficient"
+            w["triggered_rules"] = []
+            w["alarm_id"] = None
+            continue
+        w["evaluated"] = True
+        rpm_mid = (w["rpm_min"] + w["rpm_max"]) / 2
+        level, rules = evaluate_window(w, th, rpm_mid)
+        w["level"] = level
+        w["triggered_rules"] = rules
+        w["alarm_id"] = None
+        if level != "normal":
+            if LEVELS.index(level) > LEVELS.index(overall_level):
+                overall_level = level
+            top = max(rules, key=lambda r: LEVELS.index(r["level"]))
+            window_time = (reference_time + timedelta(seconds=w["window_start"])).astimezone(timezone.utc).isoformat()
+            w["alarm_id"] = db.create_alarm({
+                "equipment_id": req.equipment_id,
+                "severity": level,
+                "metric": top["metric"],
+                "value": top["value"],
+                "threshold": top["threshold"],
+                "rule": top["rule"],
+                "message": (
+                    f"时间窗 #{w['window_index']}（{w['window_start']:.3f}s~{w['window_end']:.3f}s，"
+                    f"转速 {w['rpm_min']:.0f}~{w['rpm_max']:.0f} rpm）：{top['message']}"
+                ),
+                "triggered_rules": rules,
+                "window_index": w["window_index"],
+                "window_start": w["window_start"],
+                "window_end": w["window_end"],
+                "rpm_min": w["rpm_min"],
+                "rpm_max": w["rpm_max"],
+                "sample_count": w["sample_count"],
+                "window_time": window_time,
+                "reference_time": reference_iso,
+            })
+            alarm_count += 1
+
+    return {
+        "equipment_id": req.equipment_id,
+        "window_seconds": req.window_seconds,
+        "rpm_bins": req.rpm_bins,
+        "window_count": len(windows),
+        "sample_count": len(samples),
+        "overall_level": overall_level,
+        "alarm_count": alarm_count,
+        "windows": windows,
+    }
+
+
+# ---------- 告警管理 ----------
+
+@app.get("/api/v1/alarms", response_model=AlarmPage)
+def list_alarms(
+    equipment_id: str | None = Query(default=None),
+    status: str | None = Query(default=None, pattern="^(open|acknowledged)$"),
+    severity: str | None = Query(default=None, pattern="^(attention|critical)$"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """按设备 / 状态 / 严重级别分页查询告警，含操作留痕。"""
+    items, total = db.query_alarms(
+        equipment_id=equipment_id, status=status, severity=severity, limit=limit, offset=offset
+    )
+    return {"total": total, "items": items}
+
+
+@app.get("/api/v1/alarms/{alarm_id}", response_model=Alarm)
+def get_alarm(alarm_id: int) -> dict:
+    """查询单条告警详情（含确认/备注事件流）。"""
+    alarm = db.get_alarm(alarm_id)
+    if alarm is None:
+        raise ApiError(404, "ALARM_NOT_FOUND", f"告警 {alarm_id} 不存在")
+    return alarm
+
+
+@app.post("/api/v1/alarms/{alarm_id}/acknowledge", response_model=Alarm)
+def acknowledge_alarm(alarm_id: int, req: AlarmAckRequest) -> dict:
+    """确认告警（交班处理）：记录操作者与备注，仅 open 告警可确认。"""
+    result = db.acknowledge_alarm(alarm_id, req.operator, req.note)
+    if result is None:
+        raise ApiError(404, "ALARM_NOT_FOUND", f"告警 {alarm_id} 不存在")
+    if result.get("conflict"):
+        raise ApiError(409, "ALARM_ALREADY_ACKNOWLEDGED", f"告警 {alarm_id} 已被确认，不能重复确认")
+    return result
+
+
+@app.post("/api/v1/alarms/{alarm_id}/notes", status_code=201)
+def add_alarm_note(alarm_id: int, req: AlarmNoteRequest) -> dict:
+    """为告警追加备注并记录操作者留痕。"""
+    result = db.add_alarm_note(alarm_id, req.operator, req.note)
+    if result is None:
+        raise ApiError(404, "ALARM_NOT_FOUND", f"告警 {alarm_id} 不存在")
+    return result["event"]
 
 
 # ---------- 阈值配置 ----------

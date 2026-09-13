@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -21,10 +22,53 @@ class SampleIn(BaseModel):
         return v
 
 
+class WindowSampleIn(BaseModel):
+    """带转速的窗口样本：rpm 为瞬时转速（转/分）。"""
+
+    t: float
+    a: float
+    rpm: float
+
+    @field_validator("t", "a", "rpm")
+    @classmethod
+    def must_be_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("样本值必须是有限数值，不允许 NaN/Inf")
+        return v
+
+    @field_validator("rpm")
+    @classmethod
+    def rpm_non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("转速不能为负数")
+        return v
+
+
 class AnalysisRequest(BaseModel):
     equipment_id: str = Field(min_length=1, max_length=64, description="设备标识")
     sampling_frequency: float = Field(gt=0, le=1_000_000, description="采样频率 Hz")
     samples: list[SampleIn] = Field(min_length=1, description="按时间排列的加速度样本")
+
+
+class WindowAnalysisRequest(BaseModel):
+    """时间窗 × 转速工况分析请求。"""
+
+    equipment_id: str = Field(min_length=1, max_length=64, description="设备标识")
+    window_seconds: float = Field(default=1.0, gt=0, le=3600, description="时间窗长度（秒）")
+    rpm_bins: list[float] = Field(min_length=2, description="转速区间边界（升序，区间左闭右开）")
+    reference_time: datetime | None = Field(
+        default=None, description="t=0 对应的绝对时间（ISO 8601），用于告警时间戳；缺省取当前 UTC 时间"
+    )
+    samples: list[WindowSampleIn] = Field(min_length=1, description="按时间排列、含转速的样本")
+
+    @field_validator("rpm_bins")
+    @classmethod
+    def bins_strictly_increasing(cls, v: list[float]) -> list[float]:
+        if any(v[i] >= v[i + 1] for i in range(len(v) - 1)):
+            raise ValueError("转速区间边界必须严格递增")
+        if any(not math.isfinite(x) for x in v):
+            raise ValueError("转速区间边界必须是有限数值")
+        return v
 
 
 class ThresholdConfig(BaseModel):
@@ -38,7 +82,10 @@ class ThresholdConfig(BaseModel):
     crest_critical: float = Field(gt=1, description="峰值因子严重阈值")
     peak_attention: float = Field(gt=0, description="瞬时幅值关注阈值 m/s²（连续超限判定用）")
     peak_critical: float = Field(gt=0, description="瞬时幅值严重阈值 m/s²（连续超限判定用）")
+    kurtosis_attention: float = Field(default=4.0, gt=0, description="窗口峭度关注阈值")
+    kurtosis_critical: float = Field(default=8.0, gt=0, description="窗口峭度严重阈值")
     window_seconds: float = Field(gt=0, le=3600, description="连续超限窗口时长（秒）")
+    window_min_samples: int = Field(default=4, ge=1, le=1_000_000, description="窗口指标判定所需最少样本数")
     min_samples: int = Field(default=8, ge=2, le=1_000_000, description="分析所需最少样本数")
 
     @model_validator(mode="after")
@@ -48,6 +95,7 @@ class ThresholdConfig(BaseModel):
             ("p2p_attention", "p2p_critical"),
             ("crest_attention", "crest_critical"),
             ("peak_attention", "peak_critical"),
+            ("kurtosis_attention", "kurtosis_critical"),
         ]
         for lo, hi in pairs:
             if getattr(self, lo) >= getattr(self, hi):
@@ -90,3 +138,90 @@ class SamplePage(BaseModel):
     offset: int
     limit: int
     samples: list[dict]
+
+
+class WindowMetrics(BaseModel):
+    """单个“时间窗 × 转速区间”的聚合结果。"""
+
+    window_index: int
+    window_start: float
+    window_end: float
+    rpm_bin_index: int
+    rpm_min: float
+    rpm_max: float
+    t_start: float
+    t_end: float
+    sample_count: int
+    rms: float
+    peak_abs: float
+    kurtosis: float
+    peak_to_peak: float
+    evaluated: bool
+    level: Literal["normal", "attention", "critical", "insufficient"]
+    triggered_rules: list[TriggeredRule] = []
+    alarm_id: int | None = None
+
+
+class WindowAnalysisResult(BaseModel):
+    equipment_id: str
+    window_seconds: float
+    rpm_bins: list[float]
+    window_count: int
+    sample_count: int
+    overall_level: Literal["normal", "attention", "critical"]
+    alarm_count: int
+    windows: list[WindowMetrics]
+
+
+class AlarmAckRequest(BaseModel):
+    """确认告警（交接给下一班）。"""
+
+    operator: str = Field(min_length=1, max_length=64, description="操作者标识")
+    note: str = Field(default="", max_length=1000, description="确认备注")
+
+
+class AlarmNoteRequest(BaseModel):
+    """为告警追加备注。"""
+
+    operator: str = Field(min_length=1, max_length=64, description="操作者标识")
+    note: str = Field(min_length=1, max_length=1000, description="备注内容")
+
+
+class AlarmEvent(BaseModel):
+    id: int
+    alarm_id: int
+    event_type: Literal["created", "acknowledged", "noted"]
+    operator: str
+    note: str
+    created_at: str
+
+
+class Alarm(BaseModel):
+    id: int
+    equipment_id: str
+    severity: Literal["attention", "critical"]
+    status: Literal["open", "acknowledged"]
+    metric: str
+    value: float
+    threshold: float
+    rule: str
+    message: str
+    triggered_rules: list[dict]
+    window_index: int
+    window_start: float
+    window_end: float
+    rpm_min: float
+    rpm_max: float
+    sample_count: int
+    window_time: str
+    reference_time: str
+    created_at: str
+    acknowledged_at: str | None = None
+    acknowledged_by: str | None = None
+    note: str
+    events: list[AlarmEvent] = []
+
+
+class AlarmPage(BaseModel):
+    total: int
+    items: list[Alarm]
