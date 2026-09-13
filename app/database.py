@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS thresholds (
     peak_critical    REAL NOT NULL,
     kurtosis_attention REAL NOT NULL DEFAULT 4.0,
     kurtosis_critical  REAL NOT NULL DEFAULT 8.0,
+    bearing_attention_ratio REAL NOT NULL DEFAULT 0.05,
+    bearing_critical_ratio  REAL NOT NULL DEFAULT 0.15,
+    bearing_band_tolerance  REAL NOT NULL DEFAULT 0.02,
     window_min_samples  INTEGER NOT NULL DEFAULT 4,
     window_seconds   REAL NOT NULL,
     min_samples      INTEGER NOT NULL,
@@ -86,16 +89,37 @@ CREATE TABLE IF NOT EXISTS alarm_events (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS spectrum_diagnoses (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    equipment_id         TEXT NOT NULL,
+    source_record_id     INTEGER NOT NULL REFERENCES analysis_records(id),
+    sampling_frequency   REAL NOT NULL,
+    sample_count         INTEGER NOT NULL,
+    rpm                  REAL NOT NULL,
+    window_type          TEXT NOT NULL DEFAULT 'hann',
+    frequency_resolution REAL NOT NULL,
+    nyquist_frequency    REAL NOT NULL,
+    main_peak            TEXT NOT NULL,
+    order_result         TEXT NOT NULL,
+    bearing              TEXT NOT NULL,
+    level                TEXT NOT NULL CHECK (level IN ('normal', 'attention', 'critical', 'unavailable')),
+    created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_records_equipment ON analysis_records(equipment_id, id);
 CREATE INDEX IF NOT EXISTS idx_alarms_query ON alarms(equipment_id, status, severity, id);
 CREATE INDEX IF NOT EXISTS idx_alarm_events ON alarm_events(alarm_id, id);
+CREATE INDEX IF NOT EXISTS idx_spectrum_query ON spectrum_diagnoses(equipment_id, created_at, id);
 """
 
-# 旧库增量迁移：为 thresholds 补齐窗口指标列
+# 旧库增量迁移：为 thresholds 补齐窗口/轴承指标列
 THRESHOLD_MIGRATIONS = {
     "kurtosis_attention": "ALTER TABLE thresholds ADD COLUMN kurtosis_attention REAL NOT NULL DEFAULT 4.0",
     "kurtosis_critical": "ALTER TABLE thresholds ADD COLUMN kurtosis_critical REAL NOT NULL DEFAULT 8.0",
     "window_min_samples": "ALTER TABLE thresholds ADD COLUMN window_min_samples INTEGER NOT NULL DEFAULT 4",
+    "bearing_attention_ratio": "ALTER TABLE thresholds ADD COLUMN bearing_attention_ratio REAL NOT NULL DEFAULT 0.05",
+    "bearing_critical_ratio": "ALTER TABLE thresholds ADD COLUMN bearing_critical_ratio REAL NOT NULL DEFAULT 0.15",
+    "bearing_band_tolerance": "ALTER TABLE thresholds ADD COLUMN bearing_band_tolerance REAL NOT NULL DEFAULT 0.02",
 }
 
 
@@ -135,6 +159,7 @@ def upsert_threshold(equipment_id: str, cfg: dict) -> dict:
         "rms_attention", "rms_critical", "p2p_attention", "p2p_critical",
         "crest_attention", "crest_critical", "peak_attention", "peak_critical",
         "kurtosis_attention", "kurtosis_critical",
+        "bearing_attention_ratio", "bearing_critical_ratio", "bearing_band_tolerance",
         "window_seconds", "window_min_samples", "min_samples",
     ]
     values = [cfg[c] for c in cols]
@@ -358,3 +383,74 @@ def add_alarm_note(alarm_id: int, operator: str, note: str) -> dict | None:
             (alarm_id,),
         ).fetchone()
         return {"event": dict(event)}
+
+
+# ---------- 频谱诊断 ----------
+
+def save_spectrum_diagnosis(diag: dict) -> int:
+    """持久化一次频谱诊断结果（主峰、阶次、轴承诊断以 JSON 存储）。"""
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO spectrum_diagnoses
+               (equipment_id, source_record_id, sampling_frequency, sample_count, rpm,
+                window_type, frequency_resolution, nyquist_frequency,
+                main_peak, order_result, bearing, level)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                diag["equipment_id"], diag["source_record_id"], diag["sampling_frequency"],
+                diag["sample_count"], diag["rpm"], diag.get("window", "hann"),
+                diag["frequency_resolution_hz"], diag["nyquist_frequency_hz"],
+                json.dumps(diag["main_peak"], ensure_ascii=False),
+                json.dumps(diag["order"], ensure_ascii=False),
+                json.dumps(diag["bearing"], ensure_ascii=False),
+                diag["level"],
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def _row_to_diagnosis(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["diagnosis_id"] = d.pop("id")
+    d["window"] = d.pop("window_type")
+    d["frequency_resolution_hz"] = d.pop("frequency_resolution")
+    d["nyquist_frequency_hz"] = d.pop("nyquist_frequency")
+    d["main_peak"] = json.loads(d["main_peak"])
+    d["order"] = json.loads(d["order_result"])
+    d.pop("order_result", None)
+    d["bearing"] = json.loads(d["bearing"])
+    return d
+
+
+def get_spectrum_diagnosis(diagnosis_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM spectrum_diagnoses WHERE id = ?", (diagnosis_id,)).fetchone()
+    return _row_to_diagnosis(row) if row else None
+
+
+def query_spectrum_diagnoses(
+    equipment_id: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """按设备、创建时间范围（SQLite UTC，'YYYY-MM-DD HH:MM:SS'）分页查询频谱诊断。"""
+    where, params = [], []
+    if equipment_id:
+        where.append("equipment_id = ?")
+        params.append(equipment_id)
+    if start_time:
+        where.append("created_at >= ?")
+        params.append(start_time)
+    if end_time:
+        where.append("created_at <= ?")
+        params.append(end_time)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with connect() as conn:
+        total = conn.execute(f"SELECT COUNT(*) c FROM spectrum_diagnoses {clause}", params).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT * FROM spectrum_diagnoses {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return [_row_to_diagnosis(r) for r in rows], total

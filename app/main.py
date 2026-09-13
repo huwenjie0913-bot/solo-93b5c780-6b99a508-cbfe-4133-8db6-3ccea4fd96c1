@@ -26,9 +26,19 @@ from .schemas import (
     AlarmPage,
     RecordPage,
     SamplePage,
+    SpectrumDiagnosisPage,
+    SpectrumDiagnosisRequest,
+    SpectrumDiagnosisResult,
     ThresholdConfig,
     WindowAnalysisRequest,
     WindowAnalysisResult,
+)
+from .spectrum import (
+    diagnose_bearings,
+    find_main_peak,
+    order_analysis,
+    single_sided_spectrum,
+    validate_uniform_sampling,
 )
 
 @asynccontextmanager
@@ -177,6 +187,113 @@ def analyze_windows(req: WindowAnalysisRequest) -> dict:
         "alarm_count": alarm_count,
         "windows": windows,
     }
+
+
+# ---------- 频谱诊断 ----------
+
+def _parse_query_time(value: str | None, field: str) -> str | None:
+    """GET 查询参数 ISO 8601 → SQLite UTC 存储格式 'YYYY-MM-DD HH:MM:SS'。"""
+    if value is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ApiError(400, "INVALID_TIME_RANGE", f"{field} 不是合法的 ISO 8601 时间：{value}")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+@app.post("/api/v1/spectrum/diagnoses", response_model=SpectrumDiagnosisResult, status_code=201)
+def diagnose_spectrum(req: SpectrumDiagnosisRequest) -> dict:
+    """以已有采样记录为输入：去直流 + Hann 窗单边 FFT，阶次换算与轴承频带能量诊断。"""
+    record = db.get_record(req.record_id)
+    if record is None:
+        raise ApiError(404, "RECORD_NOT_FOUND", f"分析记录 {req.record_id} 不存在")
+
+    th = db.get_threshold(record["equipment_id"]) or DEFAULT_THRESHOLDS
+    thresholds = {
+        "bearing_attention_ratio": (
+            req.bearing_attention_ratio
+            if req.bearing_attention_ratio is not None
+            else th["bearing_attention_ratio"]
+        ),
+        "bearing_critical_ratio": (
+            req.bearing_critical_ratio
+            if req.bearing_critical_ratio is not None
+            else th["bearing_critical_ratio"]
+        ),
+        "bearing_band_tolerance": (
+            req.bearing_band_tolerance
+            if req.bearing_band_tolerance is not None
+            else th["bearing_band_tolerance"]
+        ),
+    }
+
+    # 采样记录可能很长，分段取出全部样本
+    samples: list[dict] = []
+    offset = 0
+    while True:
+        batch, total = db.get_samples(req.record_id, offset=offset, limit=10000)
+        samples.extend(batch)
+        offset += len(batch)
+        if offset >= total:
+            break
+    fs = float(record["sampling_frequency"])
+    validate_samples(samples, int(th["min_samples"]))
+    validate_uniform_sampling(samples, int(th["min_samples"]), fs)
+
+    spec = single_sided_spectrum(samples, fs)
+    main_peak = find_main_peak(spec)
+    order = order_analysis(spec, req.rpm, [b.model_dump() for b in req.order_bands])
+    geom = req.bearing_geometry.model_dump() if req.bearing_geometry else None
+    bearing = diagnose_bearings(spec, geom, req.rpm, thresholds)
+
+    result = {
+        "equipment_id": record["equipment_id"],
+        "source_record_id": req.record_id,
+        "sampling_frequency": fs,
+        "sample_count": spec["n"],
+        "rpm": req.rpm,
+        "window": "hann",
+        "frequency_resolution_hz": round(spec["resolution"], 6),
+        "nyquist_frequency_hz": round(spec["nyquist"], 6),
+        "main_peak": main_peak,
+        "order": order,
+        "bearing": bearing,
+        "level": bearing["status"],
+    }
+    diagnosis_id = db.save_spectrum_diagnosis(result)
+    saved = db.get_spectrum_diagnosis(diagnosis_id)
+    return {**result, "diagnosis_id": diagnosis_id, "created_at": saved["created_at"]}
+
+
+@app.get("/api/v1/spectrum/diagnoses", response_model=SpectrumDiagnosisPage)
+def list_spectrum_diagnoses(
+    equipment_id: str | None = Query(default=None),
+    start_time: str | None = Query(default=None, description="创建时间下界（ISO 8601，含）"),
+    end_time: str | None = Query(default=None, description="创建时间上界（ISO 8601，含）"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """按设备、创建时间范围分页查询频谱诊断记录。"""
+    start = _parse_query_time(start_time, "start_time")
+    end = _parse_query_time(end_time, "end_time")
+    if start is not None and end is not None and start > end:
+        raise ApiError(400, "INVALID_TIME_RANGE", "start_time 不能晚于 end_time")
+    items, total = db.query_spectrum_diagnoses(
+        equipment_id=equipment_id, start_time=start, end_time=end, limit=limit, offset=offset
+    )
+    return {"total": total, "items": items}
+
+
+@app.get("/api/v1/spectrum/diagnoses/{diagnosis_id}", response_model=SpectrumDiagnosisResult)
+def get_spectrum_diagnosis_detail(diagnosis_id: int) -> dict:
+    """查看单条频谱诊断详情（谱指标、阶次带、轴承特征频带与命中依据）。"""
+    diag = db.get_spectrum_diagnosis(diagnosis_id)
+    if diag is None:
+        raise ApiError(404, "DIAGNOSIS_NOT_FOUND", f"频谱诊断 {diagnosis_id} 不存在")
+    return diag
 
 
 # ---------- 告警管理 ----------

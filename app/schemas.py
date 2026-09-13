@@ -84,6 +84,12 @@ class ThresholdConfig(BaseModel):
     peak_critical: float = Field(gt=0, description="瞬时幅值严重阈值 m/s²（连续超限判定用）")
     kurtosis_attention: float = Field(default=4.0, gt=0, description="窗口峭度关注阈值")
     kurtosis_critical: float = Field(default=8.0, gt=0, description="窗口峭度严重阈值")
+    bearing_attention_ratio: float = Field(
+        default=0.05, gt=0, lt=1, description="轴承特征频带能量占比关注阈值")
+    bearing_critical_ratio: float = Field(
+        default=0.15, gt=0, lt=1, description="轴承特征频带能量占比严重阈值")
+    bearing_band_tolerance: float = Field(
+        default=0.02, gt=0, lt=1, description="轴承特征频带相对中心频率的半宽（±比例）")
     window_seconds: float = Field(gt=0, le=3600, description="连续超限窗口时长（秒）")
     window_min_samples: int = Field(default=4, ge=1, le=1_000_000, description="窗口指标判定所需最少样本数")
     min_samples: int = Field(default=8, ge=2, le=1_000_000, description="分析所需最少样本数")
@@ -96,6 +102,7 @@ class ThresholdConfig(BaseModel):
             ("crest_attention", "crest_critical"),
             ("peak_attention", "peak_critical"),
             ("kurtosis_attention", "kurtosis_critical"),
+            ("bearing_attention_ratio", "bearing_critical_ratio"),
         ]
         for lo, hi in pairs:
             if getattr(self, lo) >= getattr(self, hi):
@@ -225,3 +232,141 @@ class Alarm(BaseModel):
 class AlarmPage(BaseModel):
     total: int
     items: list[Alarm]
+
+
+# ---------- 频谱诊断 ----------
+
+class OrderBandIn(BaseModel):
+    """用户指定的阶次带（以转频的倍数为单位）。"""
+
+    name: str | None = Field(default=None, max_length=64, description="阶次带名称，如 1X/2X/叶片通过")
+    order_min: float = Field(gt=0, description="阶次下界（转频倍数，>0）")
+    order_max: float = Field(gt=0, description="阶次上界")
+
+    @model_validator(mode="after")
+    def min_below_max(self) -> "OrderBandIn":
+        if self.order_min >= self.order_max:
+            raise ValueError("order_min 必须小于 order_max")
+        return self
+
+
+class BearingGeometryIn(BaseModel):
+    """轴承几何参数：n 个滚动体、滚动体直径 d、节径 D、接触角 α（度）。
+
+    字段均为可选：只提供部分几何参数时轴承诊断标记 unavailable 并说明缺少的字段；
+    字段齐全后才进行物理关系校验。
+    """
+
+    ball_count: int | None = Field(default=None, gt=0, le=1000, description="滚动体数量 n")
+    ball_diameter: float | None = Field(default=None, gt=0, description="滚动体直径 d（mm）")
+    pitch_diameter: float | None = Field(default=None, gt=0, description="轴承节径 D（mm）")
+    contact_angle: float | None = Field(default=None, ge=0, le=90, description="接触角 α（度）")
+
+    @model_validator(mode="after")
+    def diameter_within_pitch(self) -> "BearingGeometryIn":
+        if self.ball_diameter is not None and self.pitch_diameter is not None:
+            if self.ball_diameter >= self.pitch_diameter:
+                raise ValueError("滚动体直径 ball_diameter 必须小于节径 pitch_diameter")
+        return self
+
+
+class SpectrumDiagnosisRequest(BaseModel):
+    """以已有采样记录为输入的频谱诊断请求。"""
+
+    record_id: int = Field(ge=1, description="已有采样分析记录 ID")
+    rpm: float = Field(gt=0, le=1_000_000, description="本次采样期间的恒定转速（转/分）")
+    order_bands: list[OrderBandIn] = Field(default_factory=list, description="用户指定的阶次带")
+    bearing_geometry: BearingGeometryIn | None = Field(
+        default=None, description="轴承几何参数；不提供时轴承诊断标记 unavailable")
+    bearing_attention_ratio: float | None = Field(
+        default=None, gt=0, lt=1, description="覆盖设备配置：频带能量占比关注阈值")
+    bearing_critical_ratio: float | None = Field(
+        default=None, gt=0, lt=1, description="覆盖设备配置：频带能量占比严重阈值")
+    bearing_band_tolerance: float | None = Field(
+        default=None, gt=0, lt=1, description="覆盖设备配置：特征频带相对半宽")
+
+    @model_validator(mode="after")
+    def bearing_thresholds_ordered(self) -> "SpectrumDiagnosisRequest":
+        if (self.bearing_attention_ratio is not None and self.bearing_critical_ratio is not None
+                and self.bearing_attention_ratio >= self.bearing_critical_ratio):
+            raise ValueError("bearing_attention_ratio 必须小于 bearing_critical_ratio")
+        return self
+
+
+class SpectrumPeak(BaseModel):
+    frequency_hz: float
+    amplitude: float
+    bin_index: int
+
+
+class OrderBandResult(BaseModel):
+    name: str
+    order_min: float
+    order_max: float
+    frequency_min_hz: float
+    frequency_max_hz: float
+    energy_ratio: float
+
+
+class OrderAnalysisResult(BaseModel):
+    rpm: float
+    shaft_frequency_hz: float
+    peak_order: float
+    max_order: float
+    bands: list[OrderBandResult]
+
+
+class BearingBandResult(BaseModel):
+    fault: str
+    name: str
+    center_frequency_hz: float
+    band_min_hz: float
+    band_max_hz: float
+    energy_ratio: float | None
+    level: Literal["normal", "attention", "critical", "out_of_range"]
+    message: str
+
+
+class BearingHit(BaseModel):
+    fault: str
+    name: str
+    level: Literal["attention", "critical"]
+    center_frequency_hz: float
+    energy_ratio: float
+    threshold: float
+    message: str
+
+
+class BearingDiagnosis(BaseModel):
+    status: Literal["normal", "attention", "critical", "unavailable"]
+    reason: str | None = None
+    missing_fields: list[str] = []
+    characteristic_frequencies_hz: dict[str, float] = {}
+    bands: list[BearingBandResult] = []
+    hits: list[BearingHit] = []
+    level: Literal["normal", "attention", "critical"] | None = None
+    attention_ratio: float
+    critical_ratio: float
+    band_tolerance: float
+
+
+class SpectrumDiagnosisResult(BaseModel):
+    diagnosis_id: int
+    equipment_id: str
+    source_record_id: int
+    sampling_frequency: float
+    sample_count: int
+    rpm: float
+    window: Literal["hann"]
+    frequency_resolution_hz: float
+    nyquist_frequency_hz: float
+    main_peak: SpectrumPeak
+    order: OrderAnalysisResult
+    bearing: BearingDiagnosis
+    level: Literal["normal", "attention", "critical", "unavailable"]
+    created_at: str | None = None
+
+
+class SpectrumDiagnosisPage(BaseModel):
+    total: int
+    items: list[dict]
