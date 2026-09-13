@@ -214,7 +214,8 @@ def diagnose_bearings(
 
     以 BPFO/BPFI/BSF/FTF 为中心、按 ``bearing_band_tolerance`` 相对容差取频带，
     依据频带能量占比阈值给出 normal / attention / critical 与命中依据；
-    特征频率越过奈奎斯特的单项标记 out_of_range，不参与判定。
+    任一派生频带（含容差半宽）越过奈奎斯特频率时直接拒绝，避免把无法评估的
+    特征频带保存为 normal。
     """
     missing = missing_geometry_fields(geom)
     if missing:
@@ -236,24 +237,36 @@ def diagnose_bearings(
     tol = thresholds["bearing_band_tolerance"]
     freqs = bearing_characteristic_frequencies(geom, rpm)
 
+    # 越界预检：任一派生频带越过奈奎斯特都无法评估，直接拒绝整次请求
+    out_of_range: list[dict] = []
+    for key, cn_name, _ in BEARING_FAULTS:
+        fc = freqs[key]
+        lo, hi = fc * (1.0 - tol), fc * (1.0 + tol)
+        if lo <= 0 or hi > spec["nyquist"] + 1e-12:
+            out_of_range.append({
+                "fault": key,
+                "name": cn_name,
+                "center_frequency_hz": _r6(fc),
+                "band_min_hz": _r6(lo),
+                "band_max_hz": _r6(hi),
+            })
+    if out_of_range:
+        names = "、".join(f"{d['name'].split(' ')[-1]}({d['center_frequency_hz']:.2f} Hz)"
+                         for d in out_of_range)
+        raise ApiError(
+            400,
+            "BAND_OUT_OF_RANGE",
+            f"轴承特征频带 {names} 越过奈奎斯特频率 {spec['nyquist']:.2f} Hz，无法评估；"
+            "请降低转速或提高采样频率",
+            {"nyquist": _r6(spec["nyquist"]), "bands": out_of_range},
+        )
+
     bands: list[dict] = []
     hits: list[dict] = []
-    evaluated_levels: list[str] = []
+    levels: list[str] = []
     for key, cn_name, fault_name in BEARING_FAULTS:
         fc = freqs[key]
         lo, hi = fc * (1.0 - tol), fc * (1.0 + tol)
-        base = {
-            "fault": key,
-            "name": cn_name,
-            "center_frequency_hz": _r6(fc),
-            "band_min_hz": _r6(lo),
-            "band_max_hz": _r6(hi),
-        }
-        if lo <= 0 or hi > spec["nyquist"] + 1e-12:
-            bands.append({**base, "energy_ratio": None, "level": "out_of_range",
-                          "message": f"{cn_name} {fc:.2f} Hz 的频带越过奈奎斯特频率 "
-                                     f"{spec['nyquist']:.2f} Hz，无法评估"})
-            continue
         ratio = band_energy_ratio(spec, lo, hi)
         if ratio >= critical:
             level = "critical"
@@ -266,8 +279,17 @@ def diagnose_bearings(
         else:
             level = "normal"
             message = (f"{cn_name} {fc:.2f} Hz ±{tol:.0%} 频带能量占比 {ratio:.2%}，低于关注阈值")
-        bands.append({**base, "energy_ratio": _r6(ratio), "level": level, "message": message})
-        evaluated_levels.append(level)
+        bands.append({
+            "fault": key,
+            "name": cn_name,
+            "center_frequency_hz": _r6(fc),
+            "band_min_hz": _r6(lo),
+            "band_max_hz": _r6(hi),
+            "energy_ratio": _r6(ratio),
+            "level": level,
+            "message": message,
+        })
+        levels.append(level)
         if level in ("attention", "critical"):
             hits.append({
                 "fault": key,
@@ -279,16 +301,11 @@ def diagnose_bearings(
                 "message": message,
             })
 
-    if not evaluated_levels:
-        overall = "normal"
-        reason: str | None = "全部轴承特征频带均越过奈奎斯特频率，未能评估"
-    else:
-        overall = "critical" if "critical" in evaluated_levels else (
-            "attention" if "attention" in evaluated_levels else "normal")
-        reason = None
+    overall = "critical" if "critical" in levels else (
+        "attention" if "attention" in levels else "normal")
     return {
         "status": overall,
-        "reason": reason,
+        "reason": None,
         "missing_fields": [],
         "characteristic_frequencies_hz": {k: _r6(v) for k, v in freqs.items()},
         "bands": bands,

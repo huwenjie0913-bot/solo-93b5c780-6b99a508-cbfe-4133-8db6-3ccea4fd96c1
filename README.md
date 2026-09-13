@@ -92,7 +92,7 @@ POST /api/v1/spectrum/diagnoses
   - BPFO = `fr·n/2·(1 − d/D·cosα)`，BPFI = `fr·n/2·(1 + d/D·cosα)`
   - BSF = `fr·D/d·(1 − (d/D·cosα)²)`，FTF = `fr/2·(1 − d/D·cosα)`
 
-  每个特征频率以 ±`bearing_band_tolerance`（默认 2%）取频带，频带能量占比 ≥ `bearing_critical_ratio`（默认 15%）判 `critical`，≥ `bearing_attention_ratio`（默认 5%）判 `attention`，否则 `normal`；`hits` 汇总命中频带及中文依据。特征频率本身越过奈奎斯特频率的单项标记 `out_of_range`，不参与等级判定。
+  每个特征频率以 ±`bearing_band_tolerance`（默认 2%）取频带，频带能量占比 ≥ `bearing_critical_ratio`（默认 15%）判 `critical`，≥ `bearing_attention_ratio`（默认 5%）判 `attention`，否则 `normal`；`hits` 汇总命中频带及中文依据。任一派生频带（含容差半宽）越过奈奎斯特频率时，整个请求以 `400 BAND_OUT_OF_RANGE` 拒绝（响应 details 列出越界频带），不会把无法评估的结果保存为 normal。
 - **无几何参数**（或仅提供部分字段）：基础谱与阶次结果照常返回，轴承诊断 `status=unavailable`，`missing_fields` 与 `reason` 说明缺少 `ball_count` / `ball_diameter` / `pitch_diameter` / `contact_angle` 中的哪些字段。
 - 三个阈值可随设备阈值配置（`bearing_*` 字段，对老调用方为可选），也可在请求中用 `bearing_attention_ratio` / `bearing_critical_ratio` / `bearing_band_tolerance` 临时覆盖。
 - 诊断结果持久化，`GET /api/v1/spectrum/diagnoses` 支持按 `equipment_id` 与创建时间范围 `start_time` / `end_time`（ISO 8601）筛选、分页；`GET .../{id}` 查看详情。

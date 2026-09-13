@@ -292,6 +292,42 @@ def test_order_band_beyond_nyquist_rejected_400(client):
     assert r.json()["error"]["code"] == "BAND_OUT_OF_RANGE"
 
 
+def test_bearing_bands_all_beyond_nyquist_rejected_400(client):
+    # 复核反例：fs=1000 → Nyquist=500Hz；rpm=100000 → 转频 1666.7Hz，
+    # 即便最小的 FTF（≈670Hz）也越过奈奎斯特，BPFO/BPFI/BSF 更甚。
+    # 请求必须被拒绝，而不是以 normal 保存无法评估的结果。
+    rid = make_record(client, "PUMP-E6", n=2048, fs=1000.0, components=((50.0, 1.0),))
+    r = diagnose(client, rid, rpm=100000.0)
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["code"] == "BAND_OUT_OF_RANGE"
+    assert err["details"]["nyquist"] == pytest.approx(500.0)
+    faults = {b["fault"] for b in err["details"]["bands"]}
+    assert faults == {"bpfo", "bpfi", "bsf", "ftf"}
+    assert all(b["band_max_hz"] > 500.0 for b in err["details"]["bands"])
+    assert "BPFO" in err["message"] and "FTF" in err["message"]
+    assert "降低转速" in err["message"]
+    # 拒绝后不产生任何诊断记录
+    assert client.get("/api/v1/spectrum/diagnoses",
+                      params={"equipment_id": "PUMP-E6"}).json()["total"] == 0
+
+
+def test_bearing_single_band_beyond_nyquist_rejected_400(client):
+    # 部分越界同样拒绝整次请求：6000rpm 下 BPFI 带上缘 >500Hz，其余频带在范围内。
+    fr = 100.0
+    ratio = GEOM["ball_diameter"] / GEOM["pitch_diameter"]
+    bpfi = fr * GEOM["ball_count"] / 2 * (1 + ratio)
+    assert bpfi * 1.02 > 500.0  # BPFI 频带越界
+    bpfo = fr * GEOM["ball_count"] / 2 * (1 - ratio)
+    assert bpfo * 1.02 < 500.0  # BPFO 仍在范围内
+    rid = make_record(client, "PUMP-E7", n=2048, fs=1000.0, components=((bpfo, 1.0),))
+    r = diagnose(client, rid, rpm=6000.0)
+    assert r.status_code == 400
+    err = r.json()["error"]
+    assert err["code"] == "BAND_OUT_OF_RANGE"
+    assert [b["fault"] for b in err["details"]["bands"]] == ["bpfi"]
+
+
 def test_invalid_order_band_422(client):
     rid = make_record(client, "PUMP-E4")
     r = diagnose(client, rid, geometry=False, order_bands=[
