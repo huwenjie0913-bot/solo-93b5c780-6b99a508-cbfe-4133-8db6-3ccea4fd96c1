@@ -111,6 +111,36 @@ POST /api/v1/spectrum/diagnoses
 - 三个阈值可随设备阈值配置（`bearing_*` 字段，对老调用方为可选），也可在请求中用 `bearing_attention_ratio` / `bearing_critical_ratio` / `bearing_band_tolerance` 临时覆盖。
 - 诊断结果持久化，`GET /api/v1/spectrum/diagnoses` 支持按 `equipment_id` 与创建时间范围 `start_time` / `end_time`（ISO 8601）筛选、分页；`GET .../{id}` 查看详情。
 
+## 包络解调诊断
+
+早期轴承缺陷的周期性冲击在原始频谱中被转频成分和结构共振淹没，直接统计特征频带能量难以说明调制来源。包络解调先在共振载波带上带通，再取 Hilbert 包络、去直流做包络谱，最后在包络谱上匹配 BPFO/BPFI/BSF/FTF 的基频、谐波与 1X 边带。
+
+```json
+POST /api/v1/envelope/diagnoses
+{
+  "record_id": 12,
+  "rpm": 1500,
+  "bearing_geometry": {
+    "ball_count": 8, "ball_diameter": 6.746,
+    "pitch_diameter": 28.5, "contact_angle": 0
+  },
+  "carrier_band": {"low_hz": 700, "high_hz": 1400},
+  "max_harmonics": 4,
+  "sideband_orders": [1],
+  "match_tolerance_hz": 2.0
+}
+```
+
+- **载波选带（二选一，均缺省时走自动选带）**：
+  - `carrier_band`：显式指定载波频带（Hz），`0 ≤ low_hz < high_hz`，上缘越过奈奎斯特频率返回 `400 BAND_OUT_OF_RANGE` 且不落库；
+  - `auto_band`：在 `region_min_hz` / `region_max_hz`（缺省 `0.02·fs/2` ~ `fs/2`）内按 `band_width_hz`（缺省 `0.2·fs/2`）生成互不重叠的候选带，逐带做 FFT 带通并计算滤波信号峭度，峭度最大者胜出。`band_selection` 返回全部候选带峭度、选中序号与中文选带依据；区域越界返回 `BAND_OUT_OF_RANGE`，带宽大于区域宽度等非法配置返回 `400 INVALID_AUTO_BAND_CONFIG`。
+- **解调链（纯 NumPy）**：FFT 零相移理想带通 → Hilbert 解析信号取模得到包络（先去均值）→ 包络减均值后单边 FFT 得到去直流包络谱。
+- **谱峰匹配**：对每个故障族生成基频 `f`、谐波 `h·f`（h 至 `max_harmonics`，不越过包络谱奈奎斯特）及边带 `h·f ± k·fr`（`sideband_orders`，缺省 1X）。每个目标在 ±`match_tolerance_hz`（且至少一个频率分辨率）窗内取最高峰；显著性门限按目标邻域（4 倍容差环带）的中位数 + 8·MAD 稳健 σ 估计并要求达到全局主峰 5%，可压住带通随机噪声包络谱的低频瑞利本底，正常信号不会误报。谱线若同时落入多个目标窗，只归属距离最近的目标，避免 BPFO/BSF 等频率相近族重复计数。
+- **故障族结果**：`fault_families` 逐族给出特征频率、基频是否命中、命中谐波次数、1X 上下边带命中明细、全部目标窗的 `peak_matches`（目标频率/峰频/偏差/是否命中）、故障族能量占比（仅显著命中的归属窗功率 / 包络谱交流功率）、`level` 与 `confidence`（high/medium/low/none）及中文判据；置信等级要求基频+谐波/边带形成证据链，`dominant_fault` 为置信与能量最高的故障族，无显著证据时为 `null`、`confidence=none`、`level=normal`。响应顶层 `conclusion` 给出综合中文判据。
+- **阈值**：故障族能量占比 ≥ `envelope_critical_ratio`（默认复用设备 `bearing_critical_ratio=0.15`）判严重，≥ `envelope_attention_ratio`（默认 0.05）判关注；可在请求中临时覆盖。
+- **错误不落库**：记录不存在（`404 RECORD_NOT_FOUND`）、采样不均匀（`400 NON_UNIFORM_SAMPLING`）、频带越界等均不写入结果；缺少几何参数时解调照常完成，但故障族匹配标记 `level=unavailable` 并列出 `missing_fields`。
+- **持久化与查询**：成功结果写入 SQLite；`GET /api/v1/envelope/diagnoses` 支持按 `equipment_id`、主导故障 `fault_type`（bpfo/bpfi/bsf/ftf）、`confidence`（high/medium/low/none）、`start_time` / `end_time`（ISO 8601）组合筛选与 `limit` / `offset` 分页；`GET .../{id}` 返回含选带依据、全部谱峰匹配与几何参数的详情，不存在返回 `404 ENVELOPE_DIAGNOSIS_NOT_FOUND`。
+
 ## 变速阶次跟踪（启停机 / 升降速）
 
 ```json
@@ -208,6 +238,9 @@ POST /api/v1/alarms/12/acknowledge
 | 窗口样本转速超出 `rpm_bins` 覆盖范围 | 400 | `RPM_OUT_OF_BINS` |
 | 采样间隔不一致（含与记录声明采样频率不符） | 400 | `NON_UNIFORM_SAMPLING` |
 | 阶次带/特征频带越过奈奎斯特频率或边界非法 | 400 | `BAND_OUT_OF_RANGE` / `INVALID_FREQUENCY_BAND` |
+| 包络解调载波带/自动选带区域越过奈奎斯特频率 | 400 | `BAND_OUT_OF_RANGE` |
+| 自动选带带宽、区域配置非法（带宽大于区域、无合法候选等） | 400 | `INVALID_AUTO_BAND_CONFIG` |
+| 包络解调结果不存在 | 404 | `ENVELOPE_DIAGNOSIS_NOT_FOUND` |
 | 转速脉冲时间未严格递增 | 400 | `PULSE_TIME_OUT_OF_ORDER` |
 | 转速脉冲未包住样本或转角不足一个分析窗 | 400 | `INSUFFICIENT_PULSE_COVERAGE` |
 | 请求阶次带越过角域奈奎斯特（samples_per_revolution/2 阶） | 400 | `ORDER_OUT_OF_RANGE` |

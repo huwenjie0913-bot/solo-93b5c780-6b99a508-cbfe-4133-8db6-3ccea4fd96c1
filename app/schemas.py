@@ -850,7 +850,7 @@ class EnvelopeDiagnosisResult(BaseModel):
     match_tolerance_hz: float
     attention_ratio: float
     critical_ratio: float
-    bearing_geometry: dict
+    bearing_geometry: dict | None
     characteristic_frequencies_hz: dict[str, float]
     fault_families: list[EnvelopeFaultFamily]
     peak_matches: list[EnvelopePeakMatch]

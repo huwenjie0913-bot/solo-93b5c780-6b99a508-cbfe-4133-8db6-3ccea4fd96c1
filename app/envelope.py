@@ -300,11 +300,13 @@ def match_all_targets(
     """
     freqs = spec["freqs"]
     amp = spec["amplitude"]
-    noise_floor = float(np.median(amp[1:])) if amp.size > 1 else 0.0
-    global_peak = float(amp[1:].max()) if amp.size > 1 else 0.0
-    # 命中线必须显著高出噪声地板（≥6 倍中位数）且达到全局主峰的 5%，
-    # 抑制纯噪声信号在大量匹配窗内的偶发高点
-    prominence = max(6.0 * noise_floor, 0.05 * global_peak)
+    ac_bins = amp[1:]
+    global_peak = float(ac_bins.max()) if ac_bins.size > 1 else 0.0
+    # 带通随机噪声的包络服从瑞利分布，其包络谱低频抬升明显（1/f 形态），
+    # 全局中位数无法描述目标频率处的本底，故显著线门限按目标邻域局部估计。
+    significance = 8.0
+    # 命中线同时要达到全局主峰的 5%，防止恒幅包络的数值残差被当成命中
+    relative_floor = 0.05 * global_peak
 
     n_bins = freqs.size
     owner_target = np.full(n_bins, -1, dtype=int)
@@ -313,6 +315,19 @@ def match_all_targets(
     for fault, targets in targets_by_fault.items():
         for target in targets:
             flat_targets.append((fault, target))
+
+    def local_prominence(f_target: float) -> float:
+        """目标频率邻域内（4 倍容差环带，剔除目标窗自身）的中位数 + 7·稳健 σ。"""
+        idx_lo = max(int(np.searchsorted(freqs, f_target - 4.0 * tolerance_hz, side="left")), 1)
+        idx_hi = int(np.searchsorted(freqs, f_target + 4.0 * tolerance_hz, "right"))
+        win_lo = max(int(np.searchsorted(freqs, f_target - tolerance_hz, "left")), 1)
+        win_hi = int(np.searchsorted(freqs, f_target + tolerance_hz, "right"))
+        ring = np.concatenate((amp[idx_lo:win_lo], amp[win_hi:idx_hi]))
+        if ring.size < 3:
+            ring = amp[1:]
+        local_median = float(np.median(ring))
+        local_sigma = 1.4826 * float(np.median(np.abs(ring - local_median)))
+        return max(local_median + significance * local_sigma, relative_floor)
 
     for ti, (_, target) in enumerate(flat_targets):
         f_target = target["target_frequency_hz"]
@@ -344,6 +359,7 @@ def match_all_targets(
             local_idx = idx_lo if idx_lo < idx_hi else 1
         peak_amp = float(amp[local_idx])
         deviation = float(freqs[local_idx] - target["target_frequency_hz"])
+        prominence = local_prominence(target["target_frequency_hz"])
         hit = bins.size > 0 and peak_amp >= prominence and abs(deviation) <= tolerance_hz + 1e-12
         if hit:
             # 能量占比只统计显著命中的目标窗，避免大量噪声窗累积出虚假能量比例
@@ -532,6 +548,7 @@ def diagnose_envelope(
     if missing:
         result.update({
             "status": "unavailable",
+            "level": "unavailable",
             "confidence": "none",
             "dominant_fault": None,
             "missing_fields": missing,
@@ -577,6 +594,8 @@ def diagnose_envelope(
     )
     dominant = ranked[0]
     overall_confidence = dominant["confidence"] if dominant["energy_ratio"] > 0 else "none"
+    # 无任何显著故障证据时不给主导故障，避免 normal 记录被按故障类型误筛
+    dominant_fault = dominant["fault"] if overall_confidence != "none" else None
     if any(f["level"] == "critical" for f in families):
         level = "critical"
     elif any(f["level"] == "attention" for f in families):
@@ -593,6 +612,7 @@ def diagnose_envelope(
     else:
         cn = next(name for k, name, _ in BEARING_FAULTS if k == dominant["fault"])
         fault_cn = next(fl for k, _, fl in BEARING_FAULTS if k == dominant["fault"])
+        level_cn = {"attention": "关注", "critical": "严重"}[level]
         action = "建议停机检查" if level == "critical" else "建议安排复检并跟踪趋势"
         conclusion = (
             f"包络解调（载波 {lo:.0f}~{hi:.0f} Hz，带通峭度 {band_kurtosis:.2f}）显示 "
@@ -604,13 +624,14 @@ def diagnose_envelope(
                if dominant["matched_sideband_harmonics"] else "")
             + f"，故障族能量占比 {dominant['energy_ratio']:.2%}，"
             f"置信等级{CONFIDENCE_LABELS[overall_confidence]}，"
-            f"综合判为{fault_cn}（{level}），{action}。"
+            f"综合判为{fault_cn}（{level_cn}），{action}。"
         )
 
     result.update({
         "status": level,
+        "level": level,
         "confidence": overall_confidence,
-        "dominant_fault": dominant["fault"],
+        "dominant_fault": dominant_fault,
         "missing_fields": [],
         "reason": None,
         "characteristic_frequencies_hz": {k: _r6(v) for k, v in char_freqs.items()},
