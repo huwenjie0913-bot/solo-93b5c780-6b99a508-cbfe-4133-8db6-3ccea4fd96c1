@@ -24,6 +24,7 @@ from .baseline import (
     find_matching_group,
 )
 from .errors import ApiError, register_error_handlers
+from .order_tracking import analyze_order_tracking
 from .schemas import (
     AnalysisRequest,
     AnalysisResult,
@@ -38,6 +39,9 @@ from .schemas import (
     BaselinePage,
     BaselineResult,
     BaselineStatusRequest,
+    OrderTrackingPage,
+    OrderTrackingRequest,
+    OrderTrackingResult,
     RecordPage,
     SamplePage,
     SpectrumDiagnosisPage,
@@ -308,6 +312,79 @@ def get_spectrum_diagnosis_detail(diagnosis_id: int) -> dict:
     if diag is None:
         raise ApiError(404, "DIAGNOSIS_NOT_FOUND", f"频谱诊断 {diagnosis_id} 不存在")
     return diag
+
+
+# ---------- 变速阶次跟踪 ----------
+
+@app.post("/api/v1/order-tracking/analyses", response_model=OrderTrackingResult, status_code=201)
+def analyze_orders_variable_speed(req: OrderTrackingRequest) -> dict:
+    """以已保存振动记录 + 转速脉冲为输入：等角度重采样、按转数滑窗计算阶次谱并合并共振转速区间。"""
+    record = db.get_record(req.record_id)
+    if record is None:
+        raise ApiError(404, "RECORD_NOT_FOUND", f"分析记录 {req.record_id} 不存在")
+
+    th = db.get_threshold(record["equipment_id"]) or DEFAULT_THRESHOLDS
+
+    # 采样记录可能很长，分段取出全部样本
+    samples: list[dict] = []
+    offset = 0
+    while True:
+        batch, total = db.get_samples(req.record_id, offset=offset, limit=10000)
+        samples.extend(batch)
+        offset += len(batch)
+        if offset >= total:
+            break
+    fs = float(record["sampling_frequency"])
+    validate_samples(samples, int(th["min_samples"]))
+    validate_uniform_sampling(samples, int(th["min_samples"]), fs)
+
+    result = analyze_order_tracking(
+        samples=samples,
+        sampling_frequency=fs,
+        pulse_times=req.pulse_times,
+        pulses_per_revolution=req.pulses_per_revolution,
+        samples_per_revolution=req.samples_per_revolution,
+        window_revolutions=req.window_revolutions,
+        overlap_revolutions=req.overlap_revolutions,
+        order_bands=[b.model_dump() for b in req.order_bands],
+        resonance_ratio_threshold=req.resonance_ratio_threshold,
+        min_consecutive_windows=req.min_consecutive_windows,
+    )
+    result["equipment_id"] = record["equipment_id"]
+    result["source_record_id"] = req.record_id
+
+    # 所有校验通过后才落库；前面的错误不会写入任何结果
+    tracking_id = db.save_order_tracking(result)
+    saved = db.get_order_tracking(tracking_id)
+    return {**result, "tracking_id": tracking_id, "created_at": saved["created_at"]}
+
+
+@app.get("/api/v1/order-tracking/analyses", response_model=OrderTrackingPage)
+def list_order_tracking(
+    equipment_id: str | None = Query(default=None),
+    start_time: str | None = Query(default=None, description="创建时间下界（ISO 8601，含）"),
+    end_time: str | None = Query(default=None, description="创建时间上界（ISO 8601，含）"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """按设备、创建时间范围分页查询变速阶次跟踪结果。"""
+    start = _parse_query_time(start_time, "start_time")
+    end = _parse_query_time(end_time, "end_time")
+    if start is not None and end is not None and start > end:
+        raise ApiError(400, "INVALID_TIME_RANGE", "start_time 不能晚于 end_time")
+    items, total = db.query_order_tracking(
+        equipment_id=equipment_id, start_time=start, end_time=end, limit=limit, offset=offset
+    )
+    return {"total": total, "items": items}
+
+
+@app.get("/api/v1/order-tracking/analyses/{tracking_id}", response_model=OrderTrackingResult)
+def get_order_tracking_detail(tracking_id: int) -> dict:
+    """查看单条阶次跟踪详情（参数、脉冲摘要、各分析窗与共振转速区间）。"""
+    result = db.get_order_tracking(tracking_id)
+    if result is None:
+        raise ApiError(404, "ORDER_TRACKING_NOT_FOUND", f"阶次跟踪结果 {tracking_id} 不存在")
+    return result
 
 
 # ---------- 振动基线 ----------

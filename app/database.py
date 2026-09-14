@@ -128,6 +128,30 @@ CREATE TABLE IF NOT EXISTS baselines (
     UNIQUE (equipment_id, version)
 );
 
+CREATE TABLE IF NOT EXISTS order_tracking_results (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    equipment_id         TEXT NOT NULL,
+    source_record_id     INTEGER NOT NULL REFERENCES analysis_records(id),
+    sampling_frequency   REAL NOT NULL,
+    sample_count         INTEGER NOT NULL,
+    pulse_count          INTEGER NOT NULL,
+    pulses_per_revolution INTEGER NOT NULL,
+    samples_per_revolution INTEGER NOT NULL,
+    window_revolutions   REAL NOT NULL,
+    overlap_revolutions  REAL NOT NULL,
+    order_resolution     REAL NOT NULL,
+    order_nyquist        REAL NOT NULL,
+    resampled_sample_count INTEGER NOT NULL,
+    resonance_ratio_threshold REAL NOT NULL,
+    min_consecutive_windows INTEGER NOT NULL,
+    order_bands          TEXT NOT NULL DEFAULT '[]',
+    pulse_summary        TEXT NOT NULL,
+    window_count         INTEGER NOT NULL DEFAULT 0,
+    windows              TEXT NOT NULL,
+    resonance_zones      TEXT NOT NULL DEFAULT '[]',
+    created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS baseline_audit_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     baseline_id INTEGER NOT NULL REFERENCES baselines(id) ON DELETE CASCADE,
@@ -142,6 +166,7 @@ CREATE INDEX IF NOT EXISTS idx_records_equipment ON analysis_records(equipment_i
 CREATE INDEX IF NOT EXISTS idx_alarms_query ON alarms(equipment_id, status, severity, id);
 CREATE INDEX IF NOT EXISTS idx_alarm_events ON alarm_events(alarm_id, id);
 CREATE INDEX IF NOT EXISTS idx_spectrum_query ON spectrum_diagnoses(equipment_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_order_tracking_query ON order_tracking_results(equipment_id, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_baselines_query ON baselines(equipment_id, status, version);
 CREATE INDEX IF NOT EXISTS idx_baseline_events ON baseline_audit_events(baseline_id, id);
 """
@@ -154,6 +179,11 @@ THRESHOLD_MIGRATIONS = {
     "bearing_attention_ratio": "ALTER TABLE thresholds ADD COLUMN bearing_attention_ratio REAL NOT NULL DEFAULT 0.05",
     "bearing_critical_ratio": "ALTER TABLE thresholds ADD COLUMN bearing_critical_ratio REAL NOT NULL DEFAULT 0.15",
     "bearing_band_tolerance": "ALTER TABLE thresholds ADD COLUMN bearing_band_tolerance REAL NOT NULL DEFAULT 0.02",
+}
+
+# 新表增量迁移：为早期 order_tracking_results 补窗口计数列
+ORDER_TRACKING_MIGRATIONS = {
+    "window_count": "ALTER TABLE order_tracking_results ADD COLUMN window_count INTEGER NOT NULL DEFAULT 0",
 }
 
 
@@ -184,6 +214,13 @@ def init_db() -> None:
         for col, ddl in THRESHOLD_MIGRATIONS.items():
             if col not in existing:
                 conn.execute(ddl)
+        ot = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='order_tracking_results'").fetchone()
+        if ot is not None:
+            existing_ot = {r["name"] for r in conn.execute(
+                "PRAGMA table_info(order_tracking_results)").fetchall()}
+            for col, ddl in ORDER_TRACKING_MIGRATIONS.items():
+                if col not in existing_ot:
+                    conn.execute(ddl)
 
 
 # ---------- 阈值 ----------
@@ -488,6 +525,82 @@ def query_spectrum_diagnoses(
             [*params, limit, offset],
         ).fetchall()
     return [_row_to_diagnosis(r) for r in rows], total
+
+
+# ---------- 变速阶次跟踪 ----------
+
+def save_order_tracking(result: dict) -> int:
+    """持久化一次变速阶次跟踪分析（参数、脉冲摘要、分析窗、共振区间以 JSON 存储）。"""
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO order_tracking_results
+               (equipment_id, source_record_id, sampling_frequency, sample_count,
+                pulse_count, pulses_per_revolution, samples_per_revolution,
+                window_revolutions, overlap_revolutions, order_resolution, order_nyquist,
+                resampled_sample_count, resonance_ratio_threshold, min_consecutive_windows,
+                order_bands, pulse_summary, window_count, windows, resonance_zones)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                result["equipment_id"], result["source_record_id"], result["sampling_frequency"],
+                result["sample_count"], result["pulse_count"], result["pulses_per_revolution"],
+                result["samples_per_revolution"], result["window_revolutions"],
+                result["overlap_revolutions"], result["order_resolution"], result["order_nyquist"],
+                result["resampled_sample_count"], result["resonance_ratio_threshold"],
+                result["min_consecutive_windows"],
+                json.dumps(result["order_bands"], ensure_ascii=False),
+                json.dumps(result["pulse_summary"], ensure_ascii=False),
+                result["window_count"],
+                json.dumps(result["windows"], ensure_ascii=False),
+                json.dumps(result["resonance_zones"], ensure_ascii=False),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def _row_to_tracking(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["tracking_id"] = d.pop("id")
+    for key in ("order_bands", "pulse_summary", "windows", "resonance_zones"):
+        d[key] = json.loads(d[key])
+    return d
+
+
+def get_order_tracking(tracking_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM order_tracking_results WHERE id = ?", (tracking_id,)
+        ).fetchone()
+    return _row_to_tracking(row) if row else None
+
+
+def query_order_tracking(
+    equipment_id: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """按设备、创建时间范围（SQLite UTC，'YYYY-MM-DD HH:MM:SS'）分页查询阶次跟踪结果。"""
+    where, params = [], []
+    if equipment_id:
+        where.append("equipment_id = ?")
+        params.append(equipment_id)
+    if start_time:
+        where.append("created_at >= ?")
+        params.append(start_time)
+    if end_time:
+        where.append("created_at <= ?")
+        params.append(end_time)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with connect() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) c FROM order_tracking_results {clause}", params
+        ).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT * FROM order_tracking_results {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return [_row_to_tracking(r) for r in rows], total
 
 
 # ---------- 振动基线 ----------

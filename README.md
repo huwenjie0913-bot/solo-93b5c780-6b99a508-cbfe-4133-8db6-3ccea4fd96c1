@@ -8,6 +8,8 @@
 
 最后提供**基线对比**：检修后的泵重新上线时，用同一设备多条已保存频谱诊断及其源分析记录，按转速分组统计 RMS、峰值因子、主峰频率、峰值阶次的中位数与离散范围，生成带版本、来源 ID 与生效时间的基线；新诊断相对基线给出各指标偏差、变化率与关注/严重等级，帮助维护人员区分“负载差异导致的同工况正常波动”与“设备状态漂移”。
 
+针对启停机、升降速过程，还提供**变速阶次跟踪**：以已保存振动记录与严格递增的转速脉冲为输入，插值转角并完成等角度重采样，把被转速变化拉宽（涂抹）的 1X、2X 等阶次成分重新压回离散谱线；按指定转数滑窗计算阶次谱，给出每窗时间范围、平均转速、阶次分辨率、主峰阶次与指定阶次带能量占比，并按能量阈值与最少连续窗数合并**共振转速区间**，帮助定位“设备在哪个转速附近发生共振”。
+
 ## 运行
 
 ```bash
@@ -30,6 +32,9 @@ uvicorn app.main:app --port 8000
 | POST | `/api/v1/spectrum/diagnoses` | 以已有记录为输入做频谱/阶次/轴承诊断并保存 |
 | GET | `/api/v1/spectrum/diagnoses` | 频谱诊断查询（`equipment_id` / `start_time` / `end_time` / 分页） |
 | GET | `/api/v1/spectrum/diagnoses/{id}` | 频谱诊断详情（谱指标、阶次带、轴承特征频带与命中依据） |
+| POST | `/api/v1/order-tracking/analyses` | 变速阶次跟踪：等角度重采样 + 按转数滑窗阶次谱 + 共振转速区间合并 |
+| GET | `/api/v1/order-tracking/analyses` | 阶次跟踪结果查询（`equipment_id` / `start_time` / `end_time` / 分页） |
+| GET | `/api/v1/order-tracking/analyses/{id}` | 阶次跟踪详情（参数、脉冲摘要、各分析窗与共振区间） |
 | POST | `/api/v1/baselines/{equipment_id}` | 按转速分组构建设备振动基线（版本自增） |
 | GET | `/api/v1/baselines` | 基线查询（`equipment_id` / `status` / 分页） |
 | GET | `/api/v1/baselines/{id}` | 基线详情（分组统计、来源 ID、审计事件流） |
@@ -106,8 +111,35 @@ POST /api/v1/spectrum/diagnoses
 - 三个阈值可随设备阈值配置（`bearing_*` 字段，对老调用方为可选），也可在请求中用 `bearing_attention_ratio` / `bearing_critical_ratio` / `bearing_band_tolerance` 临时覆盖。
 - 诊断结果持久化，`GET /api/v1/spectrum/diagnoses` 支持按 `equipment_id` 与创建时间范围 `start_time` / `end_time`（ISO 8601）筛选、分页；`GET .../{id}` 查看详情。
 
-## 振动基线与偏差对比
+## 变速阶次跟踪（启停机 / 升降速）
 
+```json
+POST /api/v1/order-tracking/analyses
+{
+  "record_id": 12,
+  "pulse_times": [0.0, 0.0249, 0.0497, ...],
+  "pulses_per_revolution": 4,
+  "samples_per_revolution": 128,
+  "window_revolutions": 8,
+  "overlap_revolutions": 4,
+  "order_bands": [
+    {"name": "1X", "order_min": 0.8, "order_max": 1.2},
+    {"name": "2X", "order_min": 1.8, "order_max": 2.2}
+  ],
+  "resonance_ratio_threshold": 0.3,
+  "min_consecutive_windows": 2
+}
+```
+
+- **等角度重采样**：`pulse_times` 为与采样记录同一时基的转速脉冲时刻（如键相 1 脉冲/转，齿轮盘按齿数给出 PPR）。第 j 个脉冲对应转角 `j/pulses_per_revolution`（转），脉冲序列给出分段线性的时间→转角映射；先在等角度网格（每转 `samples_per_revolution` 点）上反插得到各角点时间，再对原始均匀采样做线性插值取幅值。这样升速时被拉宽的阶次成分在角域重新成为离散谱线。
+- **按转数滑窗的阶次谱**：窗长 `window_revolutions`（转），相邻窗步进 = `window_revolutions − overlap_revolutions`（须为正，窗长与每转采样点数乘积不足 4 点返回 422）。每个窗去直流并加 Hann 窗做 rFFT，阶次轴单位为“阶”（转频倍数）；返回 `t_start`/`t_end`（窗的时间范围）、`duration_seconds`、转角范围、由窗内角点时间换算的 `average_rpm`（平均转速）、`order_resolution`（=1/窗长，阶）、`main_peak_order`/`main_peak_amplitude`（主峰阶次，跳过 0 阶直流线）以及各指定阶次带的 `energy_ratio`（带内功率/全谱功率，直流除外）。末尾不足一个窗长的角段丢弃。
+- **角域奈奎斯特**：重采样信号的采样率为每转 `samples_per_revolution` 点，角域奈奎斯特上限为 `samples_per_revolution / 2` 阶。任一请求阶次带越过该上限返回 `400 ORDER_OUT_OF_RANGE`（details 回显上限与越界阶次带）。
+- **共振转速区间合并**：某窗任一指定阶次带能量占比 ≥ `resonance_ratio_threshold` 即标记为候选窗；按窗序号连续的候选窗合并为一个区间，连续窗数不足 `min_consecutive_windows` 的短游程忽略。每个区间返回起止时间、覆盖窗序号与窗数、`rpm_min`/`rpm_max`/时长加权平均转速、主峰阶次范围、占比最高的主导阶次带与最大能量占比，据此定位“升降速过程中共振发生的转速段”。
+- **输入校验（不落库）**：脉冲时间必须严格递增，否则 `400 PULSE_TIME_OUT_OF_ORDER`；脉冲必须包住全部样本时间（允许时间轴相对容差）且样本区间内转角覆盖至少一个完整分析窗，否则 `400 INSUFFICIENT_PULSE_COVERAGE`（details 给出首尾缺口秒数或已覆盖转数）。源记录不存在返回 `404 RECORD_NOT_FOUND`。所有错误均不写入结果。
+- **脉冲摘要**：结果回显 `pulse_count`、首尾脉冲时间、覆盖转数、脉冲间隔最小/最大/均值与由相邻脉冲（间隔对应 1/PPR 转）推算的瞬时转速范围，用于核对脉冲质量。
+- 结果（源记录 ID、全部参数、脉冲摘要、各分析窗、共振区间）持久化；`GET /api/v1/order-tracking/analyses` 支持按 `equipment_id` 与创建时间范围分页，`GET .../{id}` 查看详情；不存在返回 `404 ORDER_TRACKING_NOT_FOUND`。
+
+## 振动基线与偏差对比
 ```json
 POST /api/v1/baselines/PUMP-01
 {
@@ -176,6 +208,10 @@ POST /api/v1/alarms/12/acknowledge
 | 窗口样本转速超出 `rpm_bins` 覆盖范围 | 400 | `RPM_OUT_OF_BINS` |
 | 采样间隔不一致（含与记录声明采样频率不符） | 400 | `NON_UNIFORM_SAMPLING` |
 | 阶次带/特征频带越过奈奎斯特频率或边界非法 | 400 | `BAND_OUT_OF_RANGE` / `INVALID_FREQUENCY_BAND` |
+| 转速脉冲时间未严格递增 | 400 | `PULSE_TIME_OUT_OF_ORDER` |
+| 转速脉冲未包住样本或转角不足一个分析窗 | 400 | `INSUFFICIENT_PULSE_COVERAGE` |
+| 请求阶次带越过角域奈奎斯特（samples_per_revolution/2 阶） | 400 | `ORDER_OUT_OF_RANGE` |
+| 阶次跟踪结果不存在 | 404 | `ORDER_TRACKING_NOT_FOUND` |
 | 查询时间范围格式非法或起止颠倒 | 400 | `INVALID_TIME_RANGE` |
 | 告警重复确认 | 409 | `ALARM_ALREADY_ACKNOWLEDGED` |
 | 基线诊断转速超出 `rpm_bins` 覆盖范围 | 400 | `RPM_OUT_OF_BINS` |

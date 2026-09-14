@@ -565,3 +565,127 @@ class BaselineComparison(BaseModel):
     overall_level: Literal["normal", "attention", "critical"]
     metrics: list[MetricComparison]
     compared_at: str
+
+
+# ---------- 变速阶次跟踪 ----------
+
+class OrderTrackingRequest(BaseModel):
+    """以已保存振动记录为输入的变速阶次跟踪请求。"""
+
+    record_id: int = Field(ge=1, description="已有采样分析记录 ID")
+    pulse_times: list[float] = Field(min_length=2, description="严格递增的转速脉冲时间（秒，与记录同时基）")
+    pulses_per_revolution: int = Field(
+        ge=1, le=10_000, description="每转脉冲数（键相为 1，齿轮盘按齿数）")
+    samples_per_revolution: int = Field(
+        default=64, ge=4, le=100_000, description="等角度重采样密度：每转采样点数（决定角域奈奎斯特）")
+    window_revolutions: float = Field(
+        default=10.0, gt=0, le=100_000, description="分析窗长度（转）")
+    overlap_revolutions: float = Field(
+        default=0.0, ge=0, description="相邻分析窗重叠转数（须小于窗长）")
+    order_bands: list[OrderBandIn] = Field(
+        default_factory=list, description="关注阶次带（如 1X/2X），用于能量占比与共振区间合并")
+    resonance_ratio_threshold: float = Field(
+        default=0.2, gt=0, lt=1, description="任一阶次带能量占比超过该值即标记为共振候选窗")
+    min_consecutive_windows: int = Field(
+        default=3, ge=1, le=10_000, description="合并共振转速区间所需的最少连续命中窗数")
+
+    @field_validator("pulse_times")
+    @classmethod
+    def pulse_times_finite(cls, v: list[float]) -> list[float]:
+        if any(not math.isfinite(x) for x in v):
+            raise ValueError("转速脉冲时间必须为有限数值，不允许 NaN/Inf")
+        return v
+
+    @model_validator(mode="after")
+    def window_and_band_params_consistent(self) -> "OrderTrackingRequest":
+        if self.overlap_revolutions >= self.window_revolutions:
+            raise ValueError("overlap_revolutions 必须小于 window_revolutions")
+        if round(self.window_revolutions * self.samples_per_revolution) < 4:
+            raise ValueError("窗长与每转采样点数乘积不足 4 点，无法计算阶次谱")
+        return self
+
+
+class PulseSummary(BaseModel):
+    """转速脉冲摘要：时间范围、间隔统计与由相邻脉冲推算的瞬时转速。"""
+
+    pulse_count: int
+    first_pulse_time: float
+    last_pulse_time: float
+    covered_revolutions: float
+    pulse_interval_min_s: float
+    pulse_interval_max_s: float
+    pulse_interval_mean_s: float
+    instantaneous_rpm_min: float
+    instantaneous_rpm_max: float
+    instantaneous_rpm_mean: float
+
+
+class OrderTrackingBandResult(BaseModel):
+    name: str
+    order_min: float
+    order_max: float
+    energy_ratio: float | None = None
+
+
+class OrderTrackingWindow(BaseModel):
+    """单个按转数切分的分析窗的阶次谱摘要。"""
+
+    window_index: int
+    t_start: float
+    t_end: float
+    duration_seconds: float
+    revolution_start: float
+    revolution_end: float
+    average_rpm: float
+    order_resolution: float
+    sample_count: int
+    main_peak_order: float
+    main_peak_amplitude: float
+    bands: list[OrderTrackingBandResult]
+
+
+class ResonanceRpmZone(BaseModel):
+    """连续命中窗合并得到的共振转速区间。"""
+
+    zone_index: int
+    window_start_index: int
+    window_end_index: int
+    window_count: int
+    t_start: float
+    t_end: float
+    rpm_min: float
+    rpm_max: float
+    average_rpm: float
+    main_peak_order_min: float
+    main_peak_order_max: float
+    dominant_band: str | None
+    max_energy_ratio: float
+
+
+class OrderTrackingResult(BaseModel):
+    tracking_id: int
+    equipment_id: str
+    source_record_id: int
+    sampling_frequency: float
+    sample_count: int
+    pulse_count: int
+    pulses_per_revolution: int
+    samples_per_revolution: int
+    window_revolutions: float
+    overlap_revolutions: float
+    order_resolution: float
+    order_nyquist: float
+    resampled_sample_count: int
+    resonance_ratio_threshold: float
+    min_consecutive_windows: int
+    order_bands: list[OrderTrackingBandResult]
+    pulse_summary: PulseSummary
+    window_count: int
+    windows: list[OrderTrackingWindow]
+    resonance_zones: list[ResonanceRpmZone]
+    created_at: str | None = None
+
+
+class OrderTrackingPage(BaseModel):
+    total: int
+    items: list[dict]
