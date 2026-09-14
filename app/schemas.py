@@ -689,3 +689,181 @@ class OrderTrackingResult(BaseModel):
 class OrderTrackingPage(BaseModel):
     total: int
     items: list[dict]
+
+
+# ---------- 包络解调诊断 ----------
+
+class CarrierBandIn(BaseModel):
+    """显式指定的载波解调频带（Hz）。"""
+
+    low_hz: float = Field(ge=0, description="载波频带下界 Hz（不得越过奈奎斯特）")
+    high_hz: float = Field(gt=0, description="载波频带上界 Hz")
+
+    @model_validator(mode="after")
+    def low_below_high(self) -> "CarrierBandIn":
+        if not (math.isfinite(self.low_hz) and math.isfinite(self.high_hz)):
+            raise ValueError("载波频带边界必须为有限数值")
+        if self.low_hz >= self.high_hz:
+            raise ValueError("low_hz 必须小于 high_hz")
+        return self
+
+
+class AutoBandIn(BaseModel):
+    """峭度自动选带参数：在候选区域内按固定带宽生成候选带，按滤波后峭度选带。"""
+
+    region_min_hz: float | None = Field(
+        default=None, ge=0, description="候选区域下界 Hz；缺省取 0.02·奈奎斯特")
+    region_max_hz: float | None = Field(
+        default=None, gt=0, description="候选区域上界 Hz；缺省取奈奎斯特频率")
+    band_width_hz: float | None = Field(
+        default=None, gt=0, description="候选带宽 Hz；缺省取 0.2·奈奎斯特")
+
+    @model_validator(mode="after")
+    def region_ordered(self) -> "AutoBandIn":
+        if (self.region_min_hz is not None and self.region_max_hz is not None
+                and self.region_min_hz >= self.region_max_hz):
+            raise ValueError("region_min_hz 必须小于 region_max_hz")
+        for name in ("region_min_hz", "region_max_hz", "band_width_hz"):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(value):
+                raise ValueError(f"{name} 必须为有限数值")
+        return self
+
+
+class EnvelopeDiagnosisRequest(BaseModel):
+    """以已保存采样记录、转速和轴承几何参数为输入的包络解调诊断请求。"""
+
+    record_id: int = Field(ge=1, description="已有采样分析记录 ID")
+    rpm: float = Field(gt=0, le=1_000_000, description="本次采样期间的恒定转速（转/分）")
+    bearing_geometry: BearingGeometryIn | None = Field(
+        default=None, description="轴承几何参数；不提供时故障族匹配标记 unavailable")
+    carrier_band: CarrierBandIn | None = Field(
+        default=None, description="显式载波频带；与 auto_band 二选一，均缺省时按默认区域峭度自动选带")
+    auto_band: AutoBandIn | None = Field(
+        default=None, description="自动选带参数；与 carrier_band 同时提供时拒绝")
+    max_harmonics: int = Field(
+        default=4, ge=1, le=50, description="每个故障族匹配的最高谐波次数")
+    sideband_orders: list[int] = Field(
+        default_factory=lambda: [1], description="1X 边带阶次（转频倍数），缺省 [1]")
+    match_tolerance_hz: float | None = Field(
+        default=None, gt=0, le=10000, description="谱峰匹配半宽 Hz；缺省 2.0")
+    envelope_attention_ratio: float | None = Field(
+        default=None, gt=0, lt=1, description="覆盖设备配置：故障族能量占比关注阈值")
+    envelope_critical_ratio: float | None = Field(
+        default=None, gt=0, lt=1, description="覆盖设备配置：故障族能量占比严重阈值")
+
+    @model_validator(mode="after")
+    def request_consistent(self) -> "EnvelopeDiagnosisRequest":
+        if self.carrier_band is not None and self.auto_band is not None:
+            raise ValueError("carrier_band 与 auto_band 不能同时指定，请二选一")
+        if (self.envelope_attention_ratio is not None
+                and self.envelope_critical_ratio is not None
+                and self.envelope_attention_ratio >= self.envelope_critical_ratio):
+            raise ValueError("envelope_attention_ratio 必须小于 envelope_critical_ratio")
+        if any(o < 1 for o in self.sideband_orders):
+            raise ValueError("sideband_orders 阶次必须为不小于 1 的正整数")
+        if len(set(self.sideband_orders)) != len(self.sideband_orders):
+            raise ValueError("sideband_orders 不能包含重复阶次")
+        return self
+
+
+class EnvelopePeakMatch(BaseModel):
+    fault: str
+    kind: Literal["fundamental", "harmonic", "lower_sideband", "upper_sideband"]
+    harmonic: int
+    sideband_order: int
+    target_frequency_hz: float
+    peak_frequency_hz: float
+    peak_amplitude: float
+    deviation_hz: float
+    matched: bool
+
+
+class EnvelopeSidebandHit(BaseModel):
+    fault: str
+    kind: Literal["lower_sideband", "upper_sideband"]
+    harmonic: int
+    sideband_order: int
+    target_frequency_hz: float
+    peak_frequency_hz: float
+    peak_amplitude: float
+    deviation_hz: float
+    matched: bool
+
+
+class EnvelopeFaultFamily(BaseModel):
+    fault: str
+    name: str
+    characteristic_frequency_hz: float
+    energy_ratio: float
+    level: Literal["normal", "attention", "critical"]
+    confidence: Literal["high", "medium", "low", "none"]
+    fundamental_matched: bool
+    matched_harmonic_orders: list[int]
+    matched_sideband_harmonics: list[int]
+    lower_sideband_hits: list[EnvelopeSidebandHit]
+    upper_sideband_hits: list[EnvelopeSidebandHit]
+    peak_matches: list[EnvelopePeakMatch]
+    message: str
+
+
+class CarrierBandResult(BaseModel):
+    low_hz: float
+    high_hz: float
+    band_kurtosis: float
+
+
+class AutoBandCandidate(BaseModel):
+    band_min_hz: float
+    band_max_hz: float
+    kurtosis: float
+
+
+class BandSelectionResult(BaseModel):
+    mode: Literal["manual", "auto"]
+    region_min_hz: float | None
+    region_max_hz: float | None
+    band_width_hz: float
+    candidate_count: int
+    selected_index: int
+    selected_band_min_hz: float
+    selected_band_max_hz: float
+    selected_kurtosis: float | None
+    candidates: list[AutoBandCandidate]
+    reason: str
+
+
+class EnvelopeDiagnosisResult(BaseModel):
+    envelope_id: int
+    equipment_id: str
+    source_record_id: int
+    sampling_frequency: float
+    sample_count: int
+    rpm: float
+    shaft_frequency_hz: float
+    nyquist_frequency_hz: float
+    frequency_resolution_hz: float
+    carrier_band: CarrierBandResult
+    band_selection: BandSelectionResult
+    max_harmonics: int
+    sideband_orders: list[int]
+    match_tolerance_hz: float
+    attention_ratio: float
+    critical_ratio: float
+    bearing_geometry: dict
+    characteristic_frequencies_hz: dict[str, float]
+    fault_families: list[EnvelopeFaultFamily]
+    peak_matches: list[EnvelopePeakMatch]
+    dominant_fault: str | None
+    confidence: Literal["high", "medium", "low", "none"]
+    level: Literal["normal", "attention", "critical", "unavailable"]
+    status: Literal["normal", "attention", "critical", "unavailable"]
+    reason: str | None = None
+    missing_fields: list[str] = []
+    conclusion: str
+    created_at: str | None = None
+
+
+class EnvelopeDiagnosisPage(BaseModel):
+    total: int
+    items: list[dict]

@@ -152,6 +152,34 @@ CREATE TABLE IF NOT EXISTS order_tracking_results (
     created_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS envelope_diagnoses (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    equipment_id         TEXT NOT NULL,
+    source_record_id     INTEGER NOT NULL REFERENCES analysis_records(id),
+    sampling_frequency   REAL NOT NULL,
+    sample_count         INTEGER NOT NULL,
+    rpm                  REAL NOT NULL,
+    shaft_frequency      REAL NOT NULL,
+    nyquist_frequency    REAL NOT NULL,
+    frequency_resolution REAL NOT NULL,
+    carrier_band         TEXT NOT NULL,
+    band_selection       TEXT NOT NULL,
+    match_config         TEXT NOT NULL,
+    attention_ratio      REAL NOT NULL,
+    critical_ratio       REAL NOT NULL,
+    bearing_geometry     TEXT,
+    characteristic_frequencies TEXT NOT NULL DEFAULT '{}',
+    fault_families       TEXT NOT NULL,
+    peak_matches         TEXT NOT NULL DEFAULT '[]',
+    dominant_fault       TEXT,
+    confidence           TEXT NOT NULL CHECK (confidence IN ('high', 'medium', 'low', 'none')),
+    level                TEXT NOT NULL CHECK (level IN ('normal', 'attention', 'critical', 'unavailable')),
+    reason               TEXT,
+    missing_fields       TEXT NOT NULL DEFAULT '[]',
+    conclusion           TEXT NOT NULL,
+    created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS baseline_audit_events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     baseline_id INTEGER NOT NULL REFERENCES baselines(id) ON DELETE CASCADE,
@@ -169,6 +197,8 @@ CREATE INDEX IF NOT EXISTS idx_spectrum_query ON spectrum_diagnoses(equipment_id
 CREATE INDEX IF NOT EXISTS idx_order_tracking_query ON order_tracking_results(equipment_id, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_baselines_query ON baselines(equipment_id, status, version);
 CREATE INDEX IF NOT EXISTS idx_baseline_events ON baseline_audit_events(baseline_id, id);
+CREATE INDEX IF NOT EXISTS idx_envelope_query
+    ON envelope_diagnoses(equipment_id, dominant_fault, confidence, created_at, id);
 """
 
 # 旧库增量迁移：为 thresholds 补齐窗口/轴承指标列
@@ -798,3 +828,113 @@ def set_baseline_status(
         )
         row = conn.execute("SELECT * FROM baselines WHERE id = ?", (baseline_id,)).fetchone()
         return _row_to_baseline(row, _load_baseline_events(conn, baseline_id))
+
+
+# ---------- 包络解调诊断 ----------
+
+def save_envelope_diagnosis(diag: dict) -> int:
+    """持久化一次包络解调诊断结果（选带依据、故障族、谱峰匹配以 JSON 存储）。"""
+    match_config = {
+        "max_harmonics": diag["max_harmonics"],
+        "sideband_orders": diag["sideband_orders"],
+        "match_tolerance_hz": diag["match_tolerance_hz"],
+    }
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO envelope_diagnoses
+               (equipment_id, source_record_id, sampling_frequency, sample_count, rpm,
+                shaft_frequency, nyquist_frequency, frequency_resolution,
+                carrier_band, band_selection, match_config, attention_ratio, critical_ratio,
+                bearing_geometry, characteristic_frequencies, fault_families, peak_matches,
+                dominant_fault, confidence, level, reason, missing_fields, conclusion)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                diag["equipment_id"], diag["source_record_id"], diag["sampling_frequency"],
+                diag["sample_count"], diag["rpm"], diag["shaft_frequency_hz"],
+                diag["nyquist_frequency_hz"], diag["frequency_resolution_hz"],
+                json.dumps(diag["carrier_band"], ensure_ascii=False),
+                json.dumps(diag["band_selection"], ensure_ascii=False),
+                json.dumps(match_config, ensure_ascii=False),
+                diag["attention_ratio"], diag["critical_ratio"],
+                json.dumps(diag.get("bearing_geometry"), ensure_ascii=False)
+                if diag.get("bearing_geometry") is not None else None,
+                json.dumps(diag["characteristic_frequencies_hz"], ensure_ascii=False),
+                json.dumps(diag["fault_families"], ensure_ascii=False),
+                json.dumps(diag["peak_matches"], ensure_ascii=False),
+                diag["dominant_fault"], diag["confidence"], diag["level"],
+                diag.get("reason"),
+                json.dumps(diag.get("missing_fields", []), ensure_ascii=False),
+                diag["conclusion"],
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def _row_to_envelope(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["envelope_id"] = d.pop("id")
+    d["shaft_frequency_hz"] = d.pop("shaft_frequency")
+    d["nyquist_frequency_hz"] = d.pop("nyquist_frequency")
+    d["frequency_resolution_hz"] = d.pop("frequency_resolution")
+    d["carrier_band"] = json.loads(d["carrier_band"])
+    d["band_selection"] = json.loads(d["band_selection"])
+    config = json.loads(d["match_config"])
+    d["max_harmonics"] = config["max_harmonics"]
+    d["sideband_orders"] = config["sideband_orders"]
+    d["match_tolerance_hz"] = config["match_tolerance_hz"]
+    d.pop("match_config", None)
+    d["bearing_geometry"] = json.loads(d["bearing_geometry"]) if d["bearing_geometry"] else None
+    d["characteristic_frequencies_hz"] = json.loads(d["characteristic_frequencies"])
+    d.pop("characteristic_frequencies", None)
+    d["fault_families"] = json.loads(d["fault_families"])
+    d["peak_matches"] = json.loads(d["peak_matches"])
+    d["missing_fields"] = json.loads(d["missing_fields"]) if d["missing_fields"] else []
+    d["status"] = d["level"]
+    return d
+
+
+def get_envelope_diagnosis(envelope_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM envelope_diagnoses WHERE id = ?", (envelope_id,)
+        ).fetchone()
+    return _row_to_envelope(row) if row else None
+
+
+def query_envelope_diagnoses(
+    equipment_id: str | None = None,
+    fault_type: str | None = None,
+    confidence: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """按设备、主导故障类型、置信等级、创建时间范围分页查询包络解调诊断。"""
+    where, params = [], []
+    if equipment_id:
+        where.append("equipment_id = ?")
+        params.append(equipment_id)
+    if fault_type:
+        # 仅返回该故障族为主导结论的记录
+        where.append("dominant_fault = ?")
+        params.append(fault_type)
+    if confidence:
+        where.append("confidence = ?")
+        params.append(confidence)
+    if start_time:
+        where.append("created_at >= ?")
+        params.append(start_time)
+    if end_time:
+        where.append("created_at <= ?")
+        params.append(end_time)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with connect() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) c FROM envelope_diagnoses {clause}", params
+        ).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT * FROM envelope_diagnoses {clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return [_row_to_envelope(r) for r in rows], total

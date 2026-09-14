@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 from fastapi import FastAPI, Query
 
 from . import database as db
@@ -24,6 +25,7 @@ from .baseline import (
     find_matching_group,
 )
 from .errors import ApiError, register_error_handlers
+from .envelope import DEFAULT_ENVELOPE_THRESHOLDS, diagnose_envelope
 from .order_tracking import analyze_order_tracking
 from .schemas import (
     AnalysisRequest,
@@ -39,6 +41,9 @@ from .schemas import (
     BaselinePage,
     BaselineResult,
     BaselineStatusRequest,
+    EnvelopeDiagnosisPage,
+    EnvelopeDiagnosisRequest,
+    EnvelopeDiagnosisResult,
     OrderTrackingPage,
     OrderTrackingRequest,
     OrderTrackingResult,
@@ -311,6 +316,109 @@ def get_spectrum_diagnosis_detail(diagnosis_id: int) -> dict:
     diag = db.get_spectrum_diagnosis(diagnosis_id)
     if diag is None:
         raise ApiError(404, "DIAGNOSIS_NOT_FOUND", f"频谱诊断 {diagnosis_id} 不存在")
+    return diag
+
+
+# ---------- 包络解调诊断 ----------
+
+def _load_record_samples(req_record_id: int) -> tuple[dict, list[dict]]:
+    """取出采样记录与全部样本；记录不存在时按统一错误结构返回 404。"""
+    record = db.get_record(req_record_id)
+    if record is None:
+        raise ApiError(404, "RECORD_NOT_FOUND", f"分析记录 {req_record_id} 不存在")
+    samples: list[dict] = []
+    offset = 0
+    while True:
+        batch, total = db.get_samples(req_record_id, offset=offset, limit=10000)
+        samples.extend(batch)
+        offset += len(batch)
+        if offset >= total:
+            break
+    return record, samples
+
+
+@app.post("/api/v1/envelope/diagnoses", response_model=EnvelopeDiagnosisResult, status_code=201)
+def diagnose_envelope_signal(req: EnvelopeDiagnosisRequest) -> dict:
+    """对已保存采样记录做包络解调：指定载波频带或按峭度自动选带，匹配 BPFO/BPFI/BSF/FTF。"""
+    record, samples = _load_record_samples(req.record_id)
+
+    th = db.get_threshold(record["equipment_id"]) or DEFAULT_THRESHOLDS
+    fs = float(record["sampling_frequency"])
+    validate_samples(samples, int(th["min_samples"]))
+    # 采样不均匀（含与声明采样频率不一致）直接拒绝，不落库
+    validate_uniform_sampling(samples, int(th["min_samples"]), fs)
+
+    thresholds = {
+        "envelope_attention_ratio": (
+            req.envelope_attention_ratio
+            if req.envelope_attention_ratio is not None
+            else th["bearing_attention_ratio"]
+        ),
+        "envelope_critical_ratio": (
+            req.envelope_critical_ratio
+            if req.envelope_critical_ratio is not None
+            else th["bearing_critical_ratio"]
+        ),
+    }
+
+    import numpy as np
+    values = np.asarray([s["a"] for s in samples], dtype=float)
+    result = diagnose_envelope(
+        values=values,
+        fs=fs,
+        geom=req.bearing_geometry.model_dump() if req.bearing_geometry else None,
+        rpm=req.rpm,
+        carrier_band=req.carrier_band.model_dump() if req.carrier_band else None,
+        auto_band=req.auto_band.model_dump() if req.auto_band else None,
+        max_harmonics=req.max_harmonics,
+        sideband_orders=req.sideband_orders,
+        match_tolerance_hz=req.match_tolerance_hz if req.match_tolerance_hz is not None else 2.0,
+        thresholds=thresholds,
+    )
+    result["equipment_id"] = record["equipment_id"]
+    result["source_record_id"] = req.record_id
+    result["sampling_frequency"] = fs
+    result["bearing_geometry"] = (
+        req.bearing_geometry.model_dump() if req.bearing_geometry is not None else None
+    )
+    # 全部校验与计算通过后才落库；前面的错误不会写入任何结果
+    envelope_id = db.save_envelope_diagnosis(result)
+    saved = db.get_envelope_diagnosis(envelope_id)
+    return {**result, "envelope_id": envelope_id, "created_at": saved["created_at"]}
+
+
+@app.get("/api/v1/envelope/diagnoses", response_model=EnvelopeDiagnosisPage)
+def list_envelope_diagnoses(
+    equipment_id: str | None = Query(default=None),
+    fault_type: str | None = Query(
+        default=None, pattern="^(bpfo|bpfi|bsf|ftf)$",
+        description="主导故障类型：bpfo/bpfi/bsf/ftf"),
+    confidence: str | None = Query(
+        default=None, pattern="^(high|medium|low|none)$", description="置信等级"),
+    start_time: str | None = Query(default=None, description="创建时间下界（ISO 8601，含）"),
+    end_time: str | None = Query(default=None, description="创建时间上界（ISO 8601，含）"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """按设备、主导故障类型、置信等级和创建时间范围分页查询包络解调诊断。"""
+    start = _parse_query_time(start_time, "start_time")
+    end = _parse_query_time(end_time, "end_time")
+    if start is not None and end is not None and start > end:
+        raise ApiError(400, "INVALID_TIME_RANGE", "start_time 不能晚于 end_time")
+    items, total = db.query_envelope_diagnoses(
+        equipment_id=equipment_id, fault_type=fault_type, confidence=confidence,
+        start_time=start, end_time=end, limit=limit, offset=offset,
+    )
+    return {"total": total, "items": items}
+
+
+@app.get("/api/v1/envelope/diagnoses/{envelope_id}", response_model=EnvelopeDiagnosisResult)
+def get_envelope_diagnosis_detail(envelope_id: int) -> dict:
+    """查看单条包络解调诊断详情（选带依据、谱峰匹配、故障族能量占比与中文判据）。"""
+    diag = db.get_envelope_diagnosis(envelope_id)
+    if diag is None:
+        raise ApiError(404, "ENVELOPE_DIAGNOSIS_NOT_FOUND",
+                       f"包络解调诊断 {envelope_id} 不存在")
     return diag
 
 
