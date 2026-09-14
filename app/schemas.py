@@ -867,3 +867,223 @@ class EnvelopeDiagnosisResult(BaseModel):
 class EnvelopeDiagnosisPage(BaseModel):
     total: int
     items: list[dict]
+
+
+# ---------- 影响系数法动平衡 ----------
+
+class PolarVectorIn(BaseModel):
+    """极坐标 1X 向量：amplitude 为幅值（与各测点振动同单位），phase_deg 为相位（度）。"""
+
+    amplitude: float = Field(ge=0, description="1X 幅值（允许 0，表示无该分量）")
+    phase_deg: float = Field(description="1X 相位（度，0° 为键相参考，角度逆转为正；按 mod 360 归一化）")
+
+    @field_validator("amplitude", "phase_deg")
+    @classmethod
+    def must_be_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("幅值 / 相位必须是有限数值，不允许 NaN/Inf")
+        return v
+
+
+class BalancePlaneIn(BaseModel):
+    """配平（校正）平面：试重半径未在试重轮次中给出时取本平面 radius_mm。"""
+
+    name: str | None = Field(default=None, max_length=64, description="平面名称，如 驱动端/自由端")
+    radius_mm: float | None = Field(default=None, gt=0, description="该平面试重 / 配重安装半径（mm）")
+
+
+class MeasurementPointIn(BaseModel):
+    """振动测点：通常布置在轴承座，单平面至少 1 个，双平面至少 2 个。"""
+
+    name: str | None = Field(default=None, max_length=64, description="测点名称，如 DE-H / NDE-V")
+    unit: str = Field(default="mm/s", max_length=16, description="幅值单位（仅记录，不参与换算）")
+
+
+class TrialRunIn(BaseModel):
+    """一轮试重：在 plane_index 平面加 m（g）×r（mm）∠angle_deg 的试重后各测点的 1X 响应。"""
+
+    plane_index: int = Field(ge=0, le=1, description="试重所在平面下标（0 起，须在平面范围内）")
+    trial_mass_g: float = Field(gt=0, description="试重质量（g，必须 >0）")
+    radius_mm: float | None = Field(default=None, gt=0, description="试重安装半径（mm）；缺省取平面半径")
+    angle_deg: float = Field(description="试重安装角（度，0° 键相参考，逆转为正）")
+    response: list[PolarVectorIn] = Field(min_length=1, description="加试重后各测点 1X 响应，数量与测点一致")
+
+    @field_validator("angle_deg")
+    @classmethod
+    def angle_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("试重角度必须是有限数值")
+        return v
+
+
+class PlaneConstraintsIn(BaseModel):
+    """单个配平平面的可执行约束：最大配重、可安装孔位、单块配重规格（均可选，缺项则不做离散配平）。"""
+
+    plane_index: int = Field(ge=0, le=1, description="约束所属平面下标（0 起）")
+    max_correction_mass_g: float | None = Field(
+        default=None, gt=0, description="该平面允许安装的最大总配重质量（g）")
+    hole_angles_deg: list[float] | None = Field(
+        default=None, min_length=1, description="可安装配重的孔位角度（度），按 mod 360 归一化后不得重复")
+    unit_weight_mass_g: float | None = Field(
+        default=None, gt=0, description="单块标准配重质量（g）；每孔可叠加多块")
+    install_radius_mm: float | None = Field(
+        default=None, gt=0, description="配重实际安装半径（mm）；缺省取该平面试重半径")
+    max_pieces_total: int | None = Field(
+        default=None, ge=1, le=100, description="该平面最多叠加块数（缺省 12）")
+
+    @field_validator("hole_angles_deg")
+    @classmethod
+    def holes_finite_and_unique(cls, v: list[float] | None) -> list[float] | None:
+        if v is None:
+            return v
+        if any(not math.isfinite(x) for x in v):
+            raise ValueError("孔位角度必须是有限数值")
+        normalized = [x % 360.0 for x in v]
+        rounded = [round(x, 9) for x in normalized]
+        if len(set(rounded)) != len(rounded):
+            raise ValueError("孔位角度归一化到 [0,360) 后存在重复孔位")
+        return v
+
+    @model_validator(mode="after")
+    def unit_weight_within_max(self) -> "PlaneConstraintsIn":
+        if (self.max_correction_mass_g is not None
+                and self.unit_weight_mass_g is not None
+                and self.unit_weight_mass_g > self.max_correction_mass_g):
+            raise ValueError(
+                f"单块配重 {self.unit_weight_mass_g:g}g 已超过最大配重 "
+                f"{self.max_correction_mass_g:g}g，无法安装任何标准配重")
+        return self
+
+
+class BalancingRequest(BaseModel):
+    """单 / 双平面影响系数法动平衡请求。"""
+
+    equipment_id: str = Field(min_length=1, max_length=64, description="设备标识")
+    speed_rpm: float | None = Field(default=None, gt=0, le=1_000_000, description="本次平衡转速（转/分，记录用）")
+    planes: list[BalancePlaneIn] = Field(
+        min_length=1, max_length=2, description="配平平面（1 个为单平面，2 个为双平面）")
+    measurement_points: list[MeasurementPointIn] = Field(
+        min_length=1, description="振动测点；双平面至少 2 个（业务校验，不足返回 400）")
+    initial_vibration: list[PolarVectorIn] = Field(
+        min_length=1, description="各测点初始 1X 幅值/相位，顺序与测点一致")
+    trial_runs: list[TrialRunIn] = Field(
+        min_length=1, max_length=2, description="试重轮次，每个平面恰好一轮")
+    constraints: list[PlaneConstraintsIn] = Field(
+        default_factory=list, description="各平面离散配重约束；缺项时离散方案标记 unavailable")
+    target_residual_amplitude: float | None = Field(
+        default=None, ge=0, description="目标残振幅值（所有测点预测残振最大值的上限）")
+    min_response_ratio: float | None = Field(
+        default=None, gt=0, lt=1,
+        description="试重响应变化下限 |ΔV|/max|V0|，缺省 0.02；低于则拒绝计算")
+    max_condition_number: float | None = Field(
+        default=None, gt=1, description="影响系数矩阵条件数上限，缺省 30；超过判病态拒绝")
+    operator: str = Field(default="system", min_length=1, max_length=64, description="操作者标识")
+    note: str = Field(default="", max_length=1000, description="备注（试重方案、工况说明等）")
+
+    @model_validator(mode="after")
+    def points_enough_for_planes(self) -> "BalancingRequest":
+        # P 个平面的影响系数矩阵秩上限为测点数，测点少于平面数必然病态，提前拒绝
+        if len(self.measurement_points) < len(self.planes):
+            raise ValueError(
+                f"测点数 {len(self.measurement_points)} 少于配平平面数 {len(self.planes)}，"
+                "影响系数矩阵秩不足，无法区分各平面配重")
+        return self
+
+
+class ComplexVector(BaseModel):
+    real: float
+    imag: float
+    amplitude: float
+    phase_deg: float
+
+
+class ContinuousPlaneSolution(BaseModel):
+    plane_index: int
+    name: str
+    install_radius_mm: float
+    correction_unbalance_g_mm: ComplexVector
+    correction_mass_g: float
+    correction_angle_deg: float
+    max_correction_mass_g: float | None = None
+    within_max_mass: bool | None = None
+
+
+class ResidualPoint(BaseModel):
+    point_index: int
+    name: str
+    real: float
+    imag: float
+    amplitude: float
+    phase_deg: float
+    within_target: bool | None = None
+
+
+class ContinuousSolution(BaseModel):
+    solver: Literal["exact", "least_squares"]
+    planes: list[ContinuousPlaneSolution]
+    predicted_residual: list[ResidualPoint]
+    max_residual_amplitude: float
+    target_residual_amplitude: float | None = None
+    target_achieved: bool | None = None
+
+
+class DiscretePiece(BaseModel):
+    hole_angle_deg: float
+    count: int
+    unit_weight_mass_g: float
+    mass_g: float
+
+
+class DiscretePlaneSolution(BaseModel):
+    plane_index: int
+    name: str
+    install_radius_mm: float
+    max_correction_mass_g: float | None = None
+    hole_angles_deg: list[float] = []
+    unit_weight_mass_g: float | None = None
+    max_pieces_total: int | None = None
+    status: Literal["available", "unavailable"]
+    missing_constraints: list[str] = []
+    pieces: list[DiscretePiece] = []
+    total_pieces: int | None = None
+    total_mass_g: float | None = None
+    resultant_unbalance_g_mm: ComplexVector | None = None
+    approximation_error_g_mm: float | None = None
+
+
+class DiscreteSolution(BaseModel):
+    status: Literal["available", "unavailable"]
+    target_residual_amplitude: float | None = None
+    target_achieved: bool | None = None
+    predicted_residual: list[ResidualPoint] | None = None
+    max_residual_amplitude: float | None = None
+    total_pieces: int | None = None
+    total_mass_g: float | None = None
+    planes: list[DiscretePlaneSolution]
+    combinations_evaluated: int
+    reasons: list[str] = []
+    reason_details: dict = {}
+    search: dict | None = None
+
+
+class BalancingResult(BaseModel):
+    balance_id: int
+    equipment_id: str
+    speed_rpm: float | None = None
+    plane_count: int
+    point_count: int
+    planes: list[dict]
+    measurement_points: list[dict]
+    raw_input: dict
+    continuous_solution: ContinuousSolution
+    discrete_solution: DiscreteSolution
+    diagnostics: dict
+    method: dict
+    note: str = ""
+    created_by: str | None = None
+    created_at: str | None = None
+
+
+class BalancingPage(BaseModel):
+    total: int
+    items: list[dict]

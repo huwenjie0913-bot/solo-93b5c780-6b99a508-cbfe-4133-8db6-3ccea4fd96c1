@@ -199,6 +199,31 @@ CREATE INDEX IF NOT EXISTS idx_baselines_query ON baselines(equipment_id, status
 CREATE INDEX IF NOT EXISTS idx_baseline_events ON baseline_audit_events(baseline_id, id);
 CREATE INDEX IF NOT EXISTS idx_envelope_query
     ON envelope_diagnoses(equipment_id, dominant_fault, confidence, created_at, id);
+
+CREATE TABLE IF NOT EXISTS balancing_jobs (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    equipment_id       TEXT NOT NULL,
+    speed_rpm          REAL,
+    plane_count        INTEGER NOT NULL CHECK (plane_count IN (1, 2)),
+    point_count        INTEGER NOT NULL,
+    raw_input          TEXT NOT NULL,
+    continuous_solution TEXT NOT NULL,
+    discrete_solution  TEXT NOT NULL,
+    diagnostics        TEXT NOT NULL,
+    method             TEXT NOT NULL,
+    condition_number   REAL NOT NULL,
+    target_residual_amplitude REAL,
+    continuous_target_achieved INTEGER,
+    discrete_status    TEXT NOT NULL CHECK (discrete_status IN ('available', 'unavailable')),
+    discrete_target_achieved   INTEGER,
+    max_residual_amplitude     REAL,
+    note               TEXT NOT NULL DEFAULT '',
+    created_by         TEXT NOT NULL DEFAULT 'system',
+    created_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_balancing_query
+    ON balancing_jobs(equipment_id, plane_count, created_at, id);
 """
 
 # 旧库增量迁移：为 thresholds 补齐窗口/轴承指标列
@@ -938,3 +963,115 @@ def query_envelope_diagnoses(
             [*params, limit, offset],
         ).fetchall()
     return [_row_to_envelope(r) for r in rows], total
+
+
+# ---------- 影响系数法动平衡 ----------
+
+def save_balancing_job(result: dict, raw_input: dict, operator: str) -> int:
+    """持久化一次动平衡计算（原始输入、连续解、离散方案、诊断与计算依据以 JSON 存储）。"""
+    cont = result["continuous_solution"]
+    disc = result["discrete_solution"]
+    diag = result["diagnostics"]
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO balancing_jobs
+               (equipment_id, speed_rpm, plane_count, point_count, raw_input,
+                continuous_solution, discrete_solution, diagnostics, method,
+                condition_number, target_residual_amplitude, continuous_target_achieved,
+                discrete_status, discrete_target_achieved, max_residual_amplitude,
+                note, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                result["equipment_id"], result.get("speed_rpm"),
+                result["plane_count"], result["point_count"],
+                json.dumps(raw_input, ensure_ascii=False),
+                json.dumps(cont, ensure_ascii=False),
+                json.dumps(disc, ensure_ascii=False),
+                json.dumps(diag, ensure_ascii=False),
+                json.dumps(result["method"], ensure_ascii=False),
+                diag["condition_number"],
+                cont.get("target_residual_amplitude"),
+                None if cont.get("target_achieved") is None else int(bool(cont["target_achieved"])),
+                disc["status"],
+                None if disc.get("target_achieved") is None else int(bool(disc["target_achieved"])),
+                disc.get("max_residual_amplitude"),
+                result.get("note", ""),
+                operator,
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def _row_to_balancing(row: sqlite3.Row, include_raw: bool) -> dict:
+    d = dict(row)
+    d["balance_id"] = d.pop("id")
+    d["speed_rpm"] = d["speed_rpm"]
+    d["continuous_target_achieved"] = (
+        None if d["continuous_target_achieved"] is None else bool(d["continuous_target_achieved"])
+    )
+    d["discrete_target_achieved"] = (
+        None if d["discrete_target_achieved"] is None else bool(d["discrete_target_achieved"])
+    )
+    d["continuous_solution"] = json.loads(d["continuous_solution"])
+    d["discrete_solution"] = json.loads(d["discrete_solution"])
+    d["diagnostics"] = json.loads(d["diagnostics"])
+    d["method"] = json.loads(d["method"])
+    if include_raw:
+        d["raw_input"] = json.loads(d["raw_input"])
+    else:
+        d.pop("raw_input", None)
+    return d
+
+
+# 列表接口回传的概要字段（不含 raw_input / 各 JSON 大字段，降低响应体积）
+_BALANCING_SUMMARY_COLUMNS = (
+    "id, equipment_id, speed_rpm, plane_count, point_count, condition_number, "
+    "target_residual_amplitude, continuous_target_achieved, discrete_status, "
+    "discrete_target_achieved, max_residual_amplitude, note, created_by, created_at"
+)
+
+
+def get_balancing_job(balance_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM balancing_jobs WHERE id = ?", (balance_id,)
+        ).fetchone()
+    return _row_to_balancing(row, include_raw=True) if row else None
+
+
+def query_balancing_jobs(
+    equipment_id: str | None = None,
+    plane_count: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """按设备、平面数量（1 / 2）分页查询动平衡记录（概要字段，不含原始输入）。"""
+    where, params = [], []
+    if equipment_id:
+        where.append("equipment_id = ?")
+        params.append(equipment_id)
+    if plane_count is not None:
+        where.append("plane_count = ?")
+        params.append(plane_count)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with connect() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) c FROM balancing_jobs {clause}", params
+        ).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT {_BALANCING_SUMMARY_COLUMNS} FROM balancing_jobs {clause} "
+            "ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    items: list[dict] = []
+    for row in rows:
+        d = dict(row)
+        d["balance_id"] = d.pop("id")
+        d["continuous_target_achieved"] = (
+            None if d["continuous_target_achieved"] is None else bool(d["continuous_target_achieved"])
+        )
+        d["discrete_target_achieved"] = (
+            None if d["discrete_target_achieved"] is None else bool(d["discrete_target_achieved"])
+        )
+        items.append(d)
+    return items, total

@@ -35,6 +35,9 @@ uvicorn app.main:app --port 8000
 | POST | `/api/v1/order-tracking/analyses` | 变速阶次跟踪：等角度重采样 + 按转数滑窗阶次谱 + 共振转速区间合并 |
 | GET | `/api/v1/order-tracking/analyses` | 阶次跟踪结果查询（`equipment_id` / `start_time` / `end_time` / 分页） |
 | GET | `/api/v1/order-tracking/analyses/{id}` | 阶次跟踪详情（参数、脉冲摘要、各分析窗与共振区间） |
+| POST | `/api/v1/balancing/jobs` | 单 / 双平面影响系数法动平衡：连续配重 + 孔位离散方案 |
+| GET | `/api/v1/balancing/jobs` | 动平衡记录查询（`equipment_id` / `plane_count` / 分页） |
+| GET | `/api/v1/balancing/jobs/{id}` | 动平衡详情（原始输入、连续解、离散方案、矩阵诊断与计算依据） |
 | POST | `/api/v1/baselines/{equipment_id}` | 按转速分组构建设备振动基线（版本自增） |
 | GET | `/api/v1/baselines` | 基线查询（`equipment_id` / `status` / 分页） |
 | GET | `/api/v1/baselines/{id}` | 基线详情（分组统计、来源 ID、审计事件流） |
@@ -169,6 +172,44 @@ POST /api/v1/order-tracking/analyses
 - **脉冲摘要**：结果回显 `pulse_count`、首尾脉冲时间、覆盖转数、脉冲间隔最小/最大/均值与由相邻脉冲（间隔对应 1/PPR 转）推算的瞬时转速范围，用于核对脉冲质量。
 - 结果（源记录 ID、全部参数、脉冲摘要、各分析窗、共振区间）持久化；`GET /api/v1/order-tracking/analyses` 支持按 `equipment_id` 与创建时间范围分页，`GET .../{id}` 查看详情；不存在返回 `404 ORDER_TRACKING_NOT_FOUND`。
 
+## 现场动平衡（单 / 双平面影响系数法）
+
+```json
+POST /api/v1/balancing/jobs
+{
+  "equipment_id": "PUMP-07", "speed_rpm": 3000,
+  "planes": [{"name": "DE", "radius_mm": 120}, {"name": "NDE", "radius_mm": 90}],
+  "measurement_points": [{"name": "DE-H", "unit": "mm/s"}, {"name": "NDE-H"}],
+  "initial_vibration": [
+    {"amplitude": 4.2, "phase_deg": 82},
+    {"amplitude": 3.6, "phase_deg": 215}
+  ],
+  "trial_runs": [
+    {"plane_index": 0, "trial_mass_g": 150, "radius_mm": 120, "angle_deg": 30,
+     "response": [{"amplitude": 5.1, "phase_deg": 60}, {"amplitude": 3.9, "phase_deg": 205}]},
+    {"plane_index": 1, "trial_mass_g": 180, "radius_mm": 90, "angle_deg": 300,
+     "response": [{"amplitude": 4.4, "phase_deg": 95}, {"amplitude": 5.8, "phase_deg": 240}]}
+  ],
+  "constraints": [
+    {"plane_index": 0, "max_correction_mass_g": 10,
+     "hole_angles_deg": [0, 45, 90, 135, 180, 225, 270, 315],
+     "unit_weight_mass_g": 0.5, "install_radius_mm": 120, "max_pieces_total": 12},
+    {"plane_index": 1, "max_correction_mass_g": 10,
+     "hole_angles_deg": [0, 45, 90, 135, 180, 225, 270, 315],
+     "unit_weight_mass_g": 0.5, "install_radius_mm": 90}
+  ],
+  "target_residual_amplitude": 1.0,
+  "operator": "zhang.san", "note": "大修后首次平衡"
+}
+```
+
+- **复数建模**：所有 1X 向量按 `z = amplitude·exp(i·phase)`（0° 为键相参考、逆转为正）换算。试重不平衡量 `T = m·r·exp(iθ)`（g·mm，试重半径取记录 `radius_mm`，缺省取平面半径，两者都缺返回 `400 MISSING_TRIAL_RADIUS`）；影响系数 `α_ij = (V1_i − V0_i) / T_j` 构成 M 测点 × P 平面的复矩阵 A（1~2 个平面，单平面至少 1 测点、双平面至少 2 测点，不足返回 422）。
+- **连续解**：解 `V0 + A·U = 0`，`U = −A⁺·V0`（Moore–Penrose 伪逆；M=P 等价复矩阵求逆，标记 `solver=exact`，M>P 超定最小二乘，标记 `least_squares`）。各平面返回校正不平衡量（实部/虚部/幅值/相位）、按安装半径换算的 `correction_mass_g` / `correction_angle_deg`；预测残振 `R = V0 + A·U` 逐测点给出，`max_residual_amplitude` 为全测点最大值。
+- **三道拒绝闸门（不落库）**：①测点/初始振动/试重轮次/响应数量对不上、试重平面越界或重复 → `400 DIMENSION_MISMATCH`（details 的 `field` 精确定位到 `trial_runs[j].response[i]` 等）；②任一测点 `|V1−V0| / max|V0| < min_response_ratio`（缺省 0.02，可调）→ `400 RESPONSE_CHANGE_TOO_SMALL`，details 列出全部变化不足的测点（轮次/平面/测点下标、变化量与比值）；③复 SVD 条件数 `cond(A) = σmax/σmin` 超过 `max_condition_number`（缺省 30，可调）→ `400 ILL_CONDITIONED_MATRIX`，回奇异值与上限。初始振动全为 0 返回 `400 INITIAL_VIBRATION_TOO_SMALL`。
+- **离散可执行方案**：每平面可设 `max_correction_mass_g`（最大总配重）、`hole_angles_deg`（可安装孔位，归一化后重复返回 422）、`unit_weight_mass_g`（单块标准配重，单块已超最大配重返回 422）、`install_radius_mm`（配重安装半径，缺省取试重半径）与 `max_pieces_total`（缺省 12）。各平面在孔位上以标准块做束搜索逼近连续不平衡量，再枚举平面间组合（双平面最多 12×12=144 组），取**全测点预测残振最大值最小**的组合，返回每孔块数、总质量/总块数、合成不平衡量与对连续解的逼近误差。孔位或单块规格缺失时该平面标记 `unavailable` 并说明缺项（`DISCRETE_UNAVAILABLE`），不给出无法执行的方案。
+- **目标残振判定**：设了 `target_residual_amplitude` 时分别给出连续解与离散方案的 `target_achieved`，并逐测点标 `within_target`。离散方案达不到目标时在 `reasons` 中明确原因：`CONTINUOUS_TARGET_UNREACHABLE`（理论最优连续解都达不到，说明测量噪声/非线性，应复查数据）、`CONTINUOUS_EXCEEDS_MAX_MASS`（连续解所需质量超过最大配重，`reason_details` 给出各面超限质量）、`DISCRETE_GRANULARITY_INSUFFICIENT`（连续解可达但孔位/块重组合不出来，需加密孔位或改单块规格）。
+- **诊断与依据**：`diagnostics` 保留初始复数向量、各面试重不平衡量、逐测点试重前后响应与变化比、完整 M×P 影响系数矩阵、奇异值、条件数与三道检查结果；`method` 逐条说明符号约定、公式、求解器与搜索策略。原始输入（`raw_input`）、连续解、离散方案、诊断全部持久化。`GET /api/v1/balancing/jobs` 支持按 `equipment_id` 与 `plane_count`（1/2）分页（概要字段）；`GET .../{id}` 返回完整详情，不存在返回 `404 BALANCING_JOB_NOT_FOUND`。
+
 ## 振动基线与偏差对比
 ```json
 POST /api/v1/baselines/PUMP-01
@@ -245,6 +286,12 @@ POST /api/v1/alarms/12/acknowledge
 | 转速脉冲未包住样本或转角不足一个分析窗 | 400 | `INSUFFICIENT_PULSE_COVERAGE` |
 | 请求阶次带越过角域奈奎斯特（samples_per_revolution/2 阶） | 400 | `ORDER_OUT_OF_RANGE` |
 | 阶次跟踪结果不存在 | 404 | `ORDER_TRACKING_NOT_FOUND` |
+| 动平衡测点 / 初始振动 / 试重轮次 / 响应数量不一致 | 400 | `DIMENSION_MISMATCH` |
+| 动平衡试重半径（记录与平面）全部缺失 | 400 | `MISSING_TRIAL_RADIUS` |
+| 试重响应变化过小（< `min_response_ratio`，数据不支撑结论） | 400 | `RESPONSE_CHANGE_TOO_SMALL` |
+| 初始 1X 振动全为 0，缺少平衡基准 | 400 | `INITIAL_VIBRATION_TOO_SMALL` |
+| 影响系数矩阵病态（条件数超 `max_condition_number`） | 400 | `ILL_CONDITIONED_MATRIX` |
+| 动平衡记录不存在 | 404 | `BALANCING_JOB_NOT_FOUND` |
 | 查询时间范围格式非法或起止颠倒 | 400 | `INVALID_TIME_RANGE` |
 | 告警重复确认 | 409 | `ALARM_ALREADY_ACKNOWLEDGED` |
 | 基线诊断转速超出 `rpm_bins` 覆盖范围 | 400 | `RPM_OUT_OF_BINS` |

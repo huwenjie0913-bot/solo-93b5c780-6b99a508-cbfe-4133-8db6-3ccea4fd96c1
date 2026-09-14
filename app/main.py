@@ -17,6 +17,7 @@ from .analysis import (
     evaluate_window,
     validate_samples,
 )
+from .balancing import solve_balancing
 from .baseline import (
     DEFAULT_DEVIATION_THRESHOLDS,
     build_rpm_groups,
@@ -34,6 +35,9 @@ from .schemas import (
     AlarmAckRequest,
     AlarmNoteRequest,
     AlarmPage,
+    BalancingPage,
+    BalancingRequest,
+    BalancingResult,
     BaselineCompareRequest,
     BaselineComparison,
     BaselineCreateRequest,
@@ -679,6 +683,86 @@ def compare_with_active_baseline(equipment_id: str, req: BaselineCompareRequest)
         raise ApiError(409, "NO_ACTIVE_BASELINE",
                        f"设备 {equipment_id} 当前没有处于启用状态的基线，请先创建或启用基线")
     return compare_with_baseline(baseline["baseline_id"], req)
+
+
+# ---------- 影响系数法动平衡 ----------
+
+def _balancing_raw_payload(req: BalancingRequest) -> dict:
+    """把请求转为引擎所需的原始输入字典，完整保留输入数据（幅值/相位/试重/约束）。"""
+    return {
+        "equipment_id": req.equipment_id,
+        "speed_rpm": req.speed_rpm,
+        "planes": [p.model_dump(exclude_none=True) for p in req.planes],
+        "measurement_points": [p.model_dump(exclude_none=True) for p in req.measurement_points],
+        "initial_vibration": [p.model_dump() for p in req.initial_vibration],
+        "trial_runs": [
+            {
+                "plane_index": t.plane_index,
+                "trial_mass_g": t.trial_mass_g,
+                "radius_mm": t.radius_mm,
+                "angle_deg": t.angle_deg,
+                "response": [p.model_dump() for p in t.response],
+            }
+            for t in req.trial_runs
+        ],
+        "constraints": [c.model_dump(exclude_none=True) for c in req.constraints],
+        "target_residual_amplitude": req.target_residual_amplitude,
+        "min_response_ratio": req.min_response_ratio,
+        "max_condition_number": req.max_condition_number,
+        "operator": req.operator,
+        "note": req.note,
+    }
+
+
+def _balancing_detail_view(job: dict) -> dict:
+    """补全动平衡详情的顶层平面 / 测点列表（列表概要不存这两个大字段，从原始输入与诊断还原）。"""
+    radii = {t["plane_index"]: t["radius_mm"]
+             for t in job["diagnostics"].get("trial_unbalances", [])}
+    job["planes"] = [
+        {"plane_index": i,
+         "name": p.get("name") or f"平面{i + 1}",
+         "trial_radius_mm": radii.get(i, p.get("radius_mm"))}
+        for i, p in enumerate(job["raw_input"]["planes"])
+    ]
+    job["measurement_points"] = [
+        {"point_index": i, "name": p.get("name") or f"测点{i + 1}"}
+        for i, p in enumerate(job["raw_input"]["measurement_points"])
+    ]
+    return job
+
+
+@app.post("/api/v1/balancing/jobs", response_model=BalancingResult, status_code=201)
+def create_balancing_job(req: BalancingRequest) -> dict:
+    """单 / 双平面影响系数法动平衡：极坐标→复数，构建影响系数矩阵求连续配重，
+    并在最大配重 / 孔位 / 单块规格约束下给出可执行离散配重组合。"""
+    raw = _balancing_raw_payload(req)
+    # 所有维度、响应变化、矩阵病态校验在引擎内完成；任何错误都不落库
+    result = solve_balancing(raw)
+    balance_id = db.save_balancing_job(result, raw, req.operator)
+    saved = db.get_balancing_job(balance_id)
+    return _balancing_detail_view(saved)
+
+
+@app.get("/api/v1/balancing/jobs", response_model=BalancingPage)
+def list_balancing_jobs(
+    equipment_id: str | None = Query(default=None),
+    plane_count: int | None = Query(default=None, ge=1, le=2, description="按平面数量筛选：1=单平面，2=双平面"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """按设备 / 平面数量分页查询动平衡记录（概要，不含原始输入与完整诊断）。"""
+    items, total = db.query_balancing_jobs(
+        equipment_id=equipment_id, plane_count=plane_count, limit=limit, offset=offset)
+    return {"total": total, "items": items}
+
+
+@app.get("/api/v1/balancing/jobs/{balance_id}", response_model=BalancingResult)
+def get_balancing_job(balance_id: int) -> dict:
+    """查看单条动平衡详情：原始输入、连续解、离散方案、影响矩阵与计算依据。"""
+    job = db.get_balancing_job(balance_id)
+    if job is None:
+        raise ApiError(404, "BALANCING_JOB_NOT_FOUND", f"动平衡计算 {balance_id} 不存在")
+    return _balancing_detail_view(job)
 
 
 # ---------- 告警管理 ----------
