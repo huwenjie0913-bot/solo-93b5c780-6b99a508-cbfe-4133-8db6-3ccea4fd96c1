@@ -106,10 +106,44 @@ CREATE TABLE IF NOT EXISTS spectrum_diagnoses (
     created_at           TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS baselines (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    equipment_id           TEXT NOT NULL,
+    version                INTEGER NOT NULL,
+    status                 TEXT NOT NULL DEFAULT 'active'
+                               CHECK (status IN ('active', 'inactive', 'superseded')),
+    grouping_type          TEXT NOT NULL CHECK (grouping_type IN ('exact', 'bins')),
+    rpm_bins               TEXT,
+    groups                 TEXT NOT NULL,
+    deviation_thresholds   TEXT NOT NULL,
+    source_diagnosis_ids   TEXT NOT NULL,
+    source_count           INTEGER NOT NULL,
+    sample_count_total     INTEGER NOT NULL,
+    min_samples_per_group  INTEGER NOT NULL,
+    effective_from         TEXT NOT NULL,
+    note                   TEXT NOT NULL DEFAULT '',
+    created_by             TEXT NOT NULL DEFAULT 'system',
+    created_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (equipment_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS baseline_audit_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    baseline_id INTEGER NOT NULL REFERENCES baselines(id) ON DELETE CASCADE,
+    event_type  TEXT NOT NULL CHECK (event_type IN ('created', 'activated', 'deactivated')),
+    operator    TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    details     TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_records_equipment ON analysis_records(equipment_id, id);
 CREATE INDEX IF NOT EXISTS idx_alarms_query ON alarms(equipment_id, status, severity, id);
 CREATE INDEX IF NOT EXISTS idx_alarm_events ON alarm_events(alarm_id, id);
 CREATE INDEX IF NOT EXISTS idx_spectrum_query ON spectrum_diagnoses(equipment_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_baselines_query ON baselines(equipment_id, status, version);
+CREATE INDEX IF NOT EXISTS idx_baseline_events ON baseline_audit_events(baseline_id, id);
 """
 
 # 旧库增量迁移：为 thresholds 补齐窗口/轴承指标列
@@ -454,3 +488,200 @@ def query_spectrum_diagnoses(
             [*params, limit, offset],
         ).fetchall()
     return [_row_to_diagnosis(r) for r in rows], total
+
+
+# ---------- 振动基线 ----------
+
+def get_baseline_sources(
+    equipment_id: str,
+    diagnosis_ids: list[int] | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+) -> list[dict]:
+    """取构建基线所需的诊断 + 源分析记录（按诊断 id 升序，保证构建可复现）。"""
+    where = ["d.equipment_id = ?"]
+    params: list = [equipment_id]
+    if diagnosis_ids:
+        where.append(f"d.id IN ({', '.join('?' * len(diagnosis_ids))})")
+        params.extend(diagnosis_ids)
+    if start_time:
+        where.append("d.created_at >= ?")
+        params.append(start_time)
+    if end_time:
+        where.append("d.created_at <= ?")
+        params.append(end_time)
+    clause = " AND ".join(where)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""SELECT d.id AS diagnosis_id, d.rpm, d.main_peak, d.order_result,
+                       d.source_record_id, r.rms, r.crest_factor
+                FROM spectrum_diagnoses d
+                JOIN analysis_records r ON r.id = d.source_record_id
+                WHERE {clause}
+                ORDER BY d.id""",
+            params,
+        ).fetchall()
+    sources = []
+    for row in rows:
+        main_peak = json.loads(row["main_peak"])
+        order_result = json.loads(row["order_result"])
+        sources.append({
+            "diagnosis_id": row["diagnosis_id"],
+            "source_record_id": row["source_record_id"],
+            "rpm": row["rpm"],
+            "main_peak_frequency_hz": main_peak["frequency_hz"],
+            "peak_order": order_result["peak_order"],
+            "rms": row["rms"],
+            "crest_factor": row["crest_factor"],
+        })
+    return sources
+
+
+def _row_to_baseline(row: sqlite3.Row, events: list[dict] | None = None) -> dict:
+    d = dict(row)
+    d["baseline_id"] = d.pop("id")
+    d["rpm_bins"] = json.loads(d["rpm_bins"]) if d["rpm_bins"] else None
+    d["groups"] = json.loads(d["groups"])
+    d["deviation_thresholds"] = json.loads(d["deviation_thresholds"])
+    d["source_diagnosis_ids"] = json.loads(d["source_diagnosis_ids"])
+    d["events"] = events or []
+    return d
+
+
+def _load_baseline_events(conn: sqlite3.Connection, baseline_id: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT id, baseline_id, event_type, operator, note, details, created_at "
+        "FROM baseline_audit_events WHERE baseline_id = ? ORDER BY id",
+        (baseline_id,),
+    ).fetchall()
+    events = []
+    for r in rows:
+        e = dict(r)
+        e["details"] = json.loads(e["details"]) if e["details"] else {}
+        events.append(e)
+    return events
+
+
+def create_baseline(
+    equipment_id: str,
+    groups: list[dict],
+    grouping_type: str,
+    rpm_bins: list[float] | None,
+    deviation_thresholds: dict,
+    source_diagnosis_ids: list[int],
+    source_count: int,
+    sample_count_total: int,
+    min_samples_per_group: int,
+    effective_from: str,
+    note: str,
+    operator: str,
+    audit_details: dict,
+) -> dict:
+    """创建新基线（同设备版本号自增），并把该设备既有 active 基线置为 superseded。"""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 AS next_version FROM baselines WHERE equipment_id = ?",
+            (equipment_id,),
+        ).fetchone()
+        version = int(row["next_version"])
+        conn.execute("UPDATE baselines SET status = 'superseded', updated_at = datetime('now') "
+                     "WHERE equipment_id = ? AND status = 'active'", (equipment_id,))
+        cur = conn.execute(
+            """INSERT INTO baselines
+               (equipment_id, version, status, grouping_type, rpm_bins, groups,
+                deviation_thresholds, source_diagnosis_ids, source_count, sample_count_total,
+                min_samples_per_group, effective_from, note, created_by)
+               VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                equipment_id, version, grouping_type,
+                json.dumps(rpm_bins, ensure_ascii=False) if rpm_bins is not None else None,
+                json.dumps(groups, ensure_ascii=False),
+                json.dumps(deviation_thresholds, ensure_ascii=False),
+                json.dumps(sorted(source_diagnosis_ids), ensure_ascii=False),
+                source_count, sample_count_total, min_samples_per_group,
+                effective_from, note, operator,
+            ),
+        )
+        baseline_id = int(cur.lastrowid)
+        conn.execute(
+            "INSERT INTO baseline_audit_events (baseline_id, event_type, operator, note, details) "
+            "VALUES (?, 'created', ?, ?, ?)",
+            (baseline_id, operator, note, json.dumps(audit_details, ensure_ascii=False)),
+        )
+        row = conn.execute("SELECT * FROM baselines WHERE id = ?", (baseline_id,)).fetchone()
+        return _row_to_baseline(row, _load_baseline_events(conn, baseline_id))
+
+
+def get_baseline(baseline_id: int) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM baselines WHERE id = ?", (baseline_id,)).fetchone()
+        if row is None:
+            return None
+        return _row_to_baseline(row, _load_baseline_events(conn, baseline_id))
+
+
+def get_active_baseline(equipment_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM baselines WHERE equipment_id = ? AND status = 'active' "
+            "ORDER BY version DESC LIMIT 1",
+            (equipment_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _row_to_baseline(row, _load_baseline_events(conn, row["id"]))
+
+
+def query_baselines(
+    equipment_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    where, params = [], []
+    if equipment_id:
+        where.append("equipment_id = ?")
+        params.append(equipment_id)
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    with connect() as conn:
+        total = conn.execute(f"SELECT COUNT(*) c FROM baselines {clause}", params).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT * FROM baselines {clause} ORDER BY equipment_id, version DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return [_row_to_baseline(r) for r in rows], total
+
+
+def set_baseline_status(
+    baseline_id: int,
+    active: bool,
+    operator: str,
+    note: str,
+    details: dict,
+) -> dict | None:
+    """启用/停用基线；重复同态操作返回 None（调用方映射为 409），事件与状态在同一事务落库。"""
+    new_status = "active" if active else "inactive"
+    event_type = "activated" if active else "deactivated"
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM baselines WHERE id = ?", (baseline_id,)).fetchone()
+        if row is None:
+            return None
+        if row["status"] == new_status:
+            return {"conflict": True}
+        if active:
+            conn.execute("UPDATE baselines SET status = 'superseded', updated_at = datetime('now') "
+                         "WHERE equipment_id = ? AND status = 'active'", (row["equipment_id"],))
+        conn.execute(
+            "UPDATE baselines SET status = ?, updated_at = datetime('now') WHERE id = ?",
+            (new_status, baseline_id),
+        )
+        conn.execute(
+            "INSERT INTO baseline_audit_events (baseline_id, event_type, operator, note, details) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (baseline_id, event_type, operator, note, json.dumps(details, ensure_ascii=False)),
+        )
+        row = conn.execute("SELECT * FROM baselines WHERE id = ?", (baseline_id,)).fetchone()
+        return _row_to_baseline(row, _load_baseline_events(conn, baseline_id))

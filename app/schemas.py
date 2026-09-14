@@ -370,3 +370,198 @@ class SpectrumDiagnosisResult(BaseModel):
 class SpectrumDiagnosisPage(BaseModel):
     total: int
     items: list[dict]
+
+
+# ---------- 基线对比 ----------
+
+class DeviationThresholds(BaseModel):
+    """各指标的相对偏差阈值（|新值-中位数|/|中位数|），attention 必须小于 critical。"""
+
+    rms_attention: float = Field(default=0.15, gt=0, le=10, description="RMS 关注相对偏差")
+    rms_critical: float = Field(default=0.30, gt=0, le=10, description="RMS 严重相对偏差")
+    crest_factor_attention: float = Field(default=0.20, gt=0, le=10, description="峰值因子关注相对偏差")
+    crest_factor_critical: float = Field(default=0.40, gt=0, le=10, description="峰值因子严重相对偏差")
+    main_peak_frequency_attention: float = Field(
+        default=0.05, gt=0, le=10, description="主峰频率关注相对偏差")
+    main_peak_frequency_critical: float = Field(
+        default=0.10, gt=0, le=10, description="主峰频率严重相对偏差")
+    peak_order_attention: float = Field(default=0.05, gt=0, le=10, description="峰值阶次关注相对偏差")
+    peak_order_critical: float = Field(default=0.10, gt=0, le=10, description="峰值阶次严重相对偏差")
+
+    def to_metric_map(self) -> dict[str, dict[str, float]]:
+        return {
+            "rms": {"attention": self.rms_attention, "critical": self.rms_critical},
+            "crest_factor": {
+                "attention": self.crest_factor_attention,
+                "critical": self.crest_factor_critical,
+            },
+            "main_peak_frequency_hz": {
+                "attention": self.main_peak_frequency_attention,
+                "critical": self.main_peak_frequency_critical,
+            },
+            "peak_order": {
+                "attention": self.peak_order_attention,
+                "critical": self.peak_order_critical,
+            },
+        }
+
+    @model_validator(mode="after")
+    def attention_below_critical(self) -> "DeviationThresholds":
+        pairs = [
+            ("rms_attention", "rms_critical"),
+            ("crest_factor_attention", "crest_factor_critical"),
+            ("main_peak_frequency_attention", "main_peak_frequency_critical"),
+            ("peak_order_attention", "peak_order_critical"),
+        ]
+        for lo, hi in pairs:
+            if getattr(self, lo) >= getattr(self, hi):
+                raise ValueError(f"{lo} 必须小于 {hi}")
+        return self
+
+
+class BaselineCreateRequest(BaseModel):
+    """基于同一设备多条已保存频谱诊断构建基线。"""
+
+    source_diagnosis_ids: list[int] | None = Field(
+        default=None, min_length=1, description="来源诊断 ID；不传则取设备全部诊断")
+    rpm_bins: list[float] | None = Field(
+        default=None, min_length=2, description="转速分组边界（升序，左闭右开）；不传则按相同转速精确归组")
+    min_samples_per_group: int = Field(
+        default=3, ge=1, le=10_000, description="每个转速分组参与统计所需的最少诊断条数")
+    start_time: datetime | None = Field(default=None, description="来源诊断创建时间下界（ISO 8601，含）")
+    end_time: datetime | None = Field(default=None, description="来源诊断创建时间上界（ISO 8601，含）")
+    deviation_thresholds: DeviationThresholds | None = Field(
+        default=None, description="偏差阈值配置；不传使用内置默认值")
+    effective_from: datetime | None = Field(
+        default=None, description="基线生效时间（ISO 8601）；缺省取当前 UTC 时间")
+    operator: str = Field(default="system", min_length=1, max_length=64, description="创建操作者")
+    note: str = Field(default="", max_length=1000, description="创建备注（检修说明等）")
+
+    @field_validator("source_diagnosis_ids")
+    @classmethod
+    def ids_positive(cls, v: list[int] | None) -> list[int] | None:
+        if v is not None and any(i < 1 for i in v):
+            raise ValueError("source_diagnosis_ids 必须为正整数")
+        return v
+
+    @field_validator("rpm_bins")
+    @classmethod
+    def bins_strictly_increasing(cls, v: list[float] | None) -> list[float] | None:
+        if v is None:
+            return v
+        if any(not math.isfinite(x) for x in v):
+            raise ValueError("转速分组边界必须是有限数值")
+        if any(v[i] >= v[i + 1] for i in range(len(v) - 1)):
+            raise ValueError("转速分组边界必须严格递增")
+        return v
+
+    @model_validator(mode="after")
+    def time_range_ordered(self) -> "BaselineCreateRequest":
+        if self.start_time is not None and self.end_time is not None and self.start_time > self.end_time:
+            raise ValueError("start_time 不能晚于 end_time")
+        return self
+
+
+class BaselineStatusRequest(BaseModel):
+    """启用 / 停用基线的操作者留痕。"""
+
+    operator: str = Field(min_length=1, max_length=64, description="操作者标识")
+    note: str = Field(default="", max_length=1000, description="操作备注")
+
+
+class BaselineCompareRequest(BaseModel):
+    """把一条已保存的频谱诊断与基线（同工况转速分组）对比。"""
+
+    diagnosis_id: int = Field(ge=1, description="待对比的已保存频谱诊断 ID")
+    deviation_thresholds: DeviationThresholds | None = Field(
+        default=None, description="临时覆盖该基线保存的偏差阈值")
+
+
+class BaselineMetricStat(BaseModel):
+    median: float
+    min: float
+    max: float
+
+
+class BaselineRpmGroup(BaseModel):
+    group_index: int
+    rpm_min: float
+    rpm_max: float
+    label: str
+    sample_count: int
+    metrics: dict[str, BaselineMetricStat]
+    source_diagnosis_ids: list[int]
+
+
+class BaselineAuditEvent(BaseModel):
+    id: int
+    baseline_id: int
+    event_type: Literal["created", "activated", "deactivated"]
+    operator: str
+    note: str
+    details: dict
+    created_at: str
+
+
+class BaselineResult(BaseModel):
+    baseline_id: int
+    equipment_id: str
+    version: int
+    status: Literal["active", "inactive", "superseded"]
+    grouping_type: Literal["exact", "bins"]
+    rpm_bins: list[float] | None
+    groups: list[BaselineRpmGroup]
+    deviation_thresholds: dict
+    source_diagnosis_ids: list[int]
+    source_count: int
+    sample_count_total: int
+    min_samples_per_group: int
+    effective_from: str
+    note: str
+    created_by: str
+    created_at: str
+    updated_at: str
+    events: list[BaselineAuditEvent] = []
+
+
+class BaselineDetail(BaselineResult):
+    """基线详情，创建接口额外回传样本数不足被跳过的转速分组。"""
+
+    skipped_groups: list[dict] = []
+
+
+class BaselinePage(BaseModel):
+    total: int
+    items: list[BaselineResult]
+
+
+class MetricComparison(BaseModel):
+    metric: str
+    label: str
+    unit: str
+    value: float
+    baseline_median: float
+    baseline_min: float
+    baseline_max: float
+    deviation: float
+    change_rate: float | None
+    within_dispersion: bool
+    attention_threshold: float
+    critical_threshold: float
+    level: Literal["normal", "attention", "critical"]
+    message: str
+
+
+class BaselineComparison(BaseModel):
+    diagnosis_id: int
+    equipment_id: str
+    rpm: float
+    baseline_id: int
+    baseline_version: int
+    baseline_status: Literal["active", "inactive", "superseded"]
+    group_index: int
+    rpm_min: float
+    rpm_max: float
+    overall_level: Literal["normal", "attention", "critical"]
+    metrics: list[MetricComparison]
+    compared_at: str

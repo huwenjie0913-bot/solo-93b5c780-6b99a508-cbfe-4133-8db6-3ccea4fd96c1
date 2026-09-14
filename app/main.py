@@ -16,6 +16,13 @@ from .analysis import (
     evaluate_window,
     validate_samples,
 )
+from .baseline import (
+    DEFAULT_DEVIATION_THRESHOLDS,
+    build_rpm_groups,
+    compare_diagnosis,
+    diagnosis_feature_values,
+    find_matching_group,
+)
 from .errors import ApiError, register_error_handlers
 from .schemas import (
     AnalysisRequest,
@@ -24,6 +31,13 @@ from .schemas import (
     AlarmAckRequest,
     AlarmNoteRequest,
     AlarmPage,
+    BaselineCompareRequest,
+    BaselineComparison,
+    BaselineCreateRequest,
+    BaselineDetail,
+    BaselinePage,
+    BaselineResult,
+    BaselineStatusRequest,
     RecordPage,
     SamplePage,
     SpectrumDiagnosisPage,
@@ -294,6 +308,192 @@ def get_spectrum_diagnosis_detail(diagnosis_id: int) -> dict:
     if diag is None:
         raise ApiError(404, "DIAGNOSIS_NOT_FOUND", f"频谱诊断 {diagnosis_id} 不存在")
     return diag
+
+
+# ---------- 振动基线 ----------
+
+def _normalize_utc(dt: datetime) -> str:
+    """datetime → SQLite UTC 存储格式 'YYYY-MM-DD HH:MM:SS'。"""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _check_source_diagnosis_ids(equipment_id: str, ids: list[int] | None, sources: list[dict]) -> None:
+    """显式指定来源 ID 时，每个 ID 必须存在且属于该设备，否则按既有错误结构返回 4xx。"""
+    if not ids:
+        return
+    found = {s["diagnosis_id"] for s in sources}
+    unknown = [i for i in dict.fromkeys(ids) if i not in found]
+    if unknown:
+        raise ApiError(
+            404,
+            "DIAGNOSIS_NOT_FOUND",
+            f"频谱诊断 {', '.join(str(i) for i in unknown)} 不存在或不属于设备 {equipment_id}",
+            {"unknown_diagnosis_ids": unknown, "equipment_id": equipment_id},
+        )
+
+
+@app.post("/api/v1/baselines/{equipment_id}", response_model=BaselineDetail, status_code=201)
+def create_baseline(equipment_id: str, req: BaselineCreateRequest) -> dict:
+    """用同一设备多条已保存频谱诊断（及源分析记录）按转速分组构建带版本的振动基线。"""
+    ids = req.source_diagnosis_ids
+    start = _parse_query_time(req.start_time.isoformat() if req.start_time else None, "start_time")
+    end = _parse_query_time(req.end_time.isoformat() if req.end_time else None, "end_time")
+    sources = db.get_baseline_sources(equipment_id, diagnosis_ids=ids, start_time=start, end_time=end)
+    _check_source_diagnosis_ids(equipment_id, ids, sources)
+    if not sources:
+        raise ApiError(
+            400,
+            "INSUFFICIENT_BASELINE_SAMPLES",
+            f"设备 {equipment_id} 没有可用于构建基线的已保存频谱诊断",
+            {"min_samples_per_group": req.min_samples_per_group, "skipped_groups": []},
+        )
+
+    entries = [
+        {
+            "diagnosis_id": s["diagnosis_id"],
+            "rpm": s["rpm"],
+            "features": {
+                "rms": s["rms"],
+                "crest_factor": s["crest_factor"],
+                "main_peak_frequency_hz": s["main_peak_frequency_hz"],
+                "peak_order": s["peak_order"],
+            },
+        }
+        for s in sources
+    ]
+    groups, skipped = build_rpm_groups(entries, req.rpm_bins, req.min_samples_per_group)
+    thresholds = (req.deviation_thresholds.to_metric_map()
+                  if req.deviation_thresholds is not None else DEFAULT_DEVIATION_THRESHOLDS)
+
+    effective_from = _normalize_utc(req.effective_from) if req.effective_from else \
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    all_ids = sorted(s["diagnosis_id"] for s in sources)
+    audit_details = {
+        "source_diagnosis_ids": all_ids,
+        "source_count": len(all_ids),
+        "grouping_type": "bins" if req.rpm_bins is not None else "exact",
+        "rpm_bins": req.rpm_bins,
+        "min_samples_per_group": req.min_samples_per_group,
+        "group_count": len(groups),
+        "skipped_groups": skipped,
+    }
+    baseline = db.create_baseline(
+        equipment_id=equipment_id,
+        groups=groups,
+        grouping_type="bins" if req.rpm_bins is not None else "exact",
+        rpm_bins=req.rpm_bins,
+        deviation_thresholds=thresholds,
+        source_diagnosis_ids=all_ids,
+        source_count=len(all_ids),
+        sample_count_total=sum(g["sample_count"] for g in groups),
+        min_samples_per_group=req.min_samples_per_group,
+        effective_from=effective_from,
+        note=req.note,
+        operator=req.operator,
+        audit_details=audit_details,
+    )
+    baseline["skipped_groups"] = skipped
+    return baseline
+
+
+@app.get("/api/v1/baselines", response_model=BaselinePage)
+def list_baselines(
+    equipment_id: str | None = Query(default=None),
+    status: str | None = Query(default=None, pattern="^(active|inactive|superseded)$"),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """按设备 / 状态分页查询基线（版本倒序）。"""
+    items, total = db.query_baselines(
+        equipment_id=equipment_id, status=status, limit=limit, offset=offset)
+    return {"total": total, "items": items}
+
+
+@app.get("/api/v1/baselines/{baseline_id}", response_model=BaselineResult)
+def get_baseline(baseline_id: int) -> dict:
+    """查询基线详情，含各转速分组中位数/离散范围与完整审计事件流。"""
+    baseline = db.get_baseline(baseline_id)
+    if baseline is None:
+        raise ApiError(404, "BASELINE_NOT_FOUND", f"振动基线 {baseline_id} 不存在")
+    return baseline
+
+
+@app.post("/api/v1/baselines/{baseline_id}/activate", response_model=BaselineResult)
+def activate_baseline(baseline_id: int, req: BaselineStatusRequest) -> dict:
+    """启用基线：同设备既有 active 基线自动转为 superseded，并记录操作者留痕。"""
+    result = db.set_baseline_status(baseline_id, True, req.operator, req.note, {})
+    if result is None:
+        raise ApiError(404, "BASELINE_NOT_FOUND", f"振动基线 {baseline_id} 不存在")
+    if result.get("conflict"):
+        raise ApiError(409, "BASELINE_ALREADY_ACTIVE", f"基线 {baseline_id} 已处于启用状态，无需重复启用")
+    return result
+
+
+@app.post("/api/v1/baselines/{baseline_id}/deactivate", response_model=BaselineResult)
+def deactivate_baseline(baseline_id: int, req: BaselineStatusRequest) -> dict:
+    """停用基线并记录操作者留痕；停用后不再作为新诊断的默认对比参照。"""
+    result = db.set_baseline_status(baseline_id, False, req.operator, req.note, {})
+    if result is None:
+        raise ApiError(404, "BASELINE_NOT_FOUND", f"振动基线 {baseline_id} 不存在")
+    if result.get("conflict"):
+        raise ApiError(409, "BASELINE_ALREADY_INACTIVE",
+                       f"基线 {baseline_id} 已处于停用状态，无需重复停用")
+    return result
+
+
+@app.post("/api/v1/baselines/{baseline_id}/compare", response_model=BaselineComparison)
+def compare_with_baseline(baseline_id: int, req: BaselineCompareRequest) -> dict:
+    """把新的已保存频谱诊断与基线同转速分组对比，给出偏差、变化率与关注/严重等级。"""
+    baseline = db.get_baseline(baseline_id)
+    if baseline is None:
+        raise ApiError(404, "BASELINE_NOT_FOUND", f"振动基线 {baseline_id} 不存在")
+
+    diag = db.get_spectrum_diagnosis(req.diagnosis_id)
+    if diag is None:
+        raise ApiError(404, "DIAGNOSIS_NOT_FOUND", f"频谱诊断 {req.diagnosis_id} 不存在")
+    if diag["equipment_id"] != baseline["equipment_id"]:
+        raise ApiError(
+            400,
+            "BASELINE_EQUIPMENT_MISMATCH",
+            f"诊断 {req.diagnosis_id} 属于设备 {diag['equipment_id']}，"
+            f"不能与设备 {baseline['equipment_id']} 的基线对比",
+            {"diagnosis_id": req.diagnosis_id, "diagnosis_equipment_id": diag["equipment_id"],
+             "baseline_equipment_id": baseline["equipment_id"]},
+        )
+    record = db.get_record(diag["source_record_id"])
+    if record is None:  # 防御：源记录理论上始终存在
+        raise ApiError(404, "RECORD_NOT_FOUND",
+                       f"频谱诊断 {req.diagnosis_id} 的源分析记录 {diag['source_record_id']} 不存在")
+
+    group = find_matching_group(float(diag["rpm"]), baseline["groups"])
+    thresholds = (req.deviation_thresholds.to_metric_map()
+                  if req.deviation_thresholds is not None else baseline["deviation_thresholds"])
+    comparison = compare_diagnosis(diag, record, group, thresholds)
+    return {
+        "diagnosis_id": req.diagnosis_id,
+        "equipment_id": diag["equipment_id"],
+        "rpm": float(diag["rpm"]),
+        "baseline_id": baseline_id,
+        "baseline_version": baseline["version"],
+        "baseline_status": baseline["status"],
+        "group_index": group["group_index"],
+        "rpm_min": group["rpm_min"],
+        "rpm_max": group["rpm_max"],
+        "compared_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        **comparison,
+    }
+
+
+@app.post("/api/v1/equipment/{equipment_id}/baseline-compare", response_model=BaselineComparison)
+def compare_with_active_baseline(equipment_id: str, req: BaselineCompareRequest) -> dict:
+    """便捷入口：直接用设备当前启用的基线对比新诊断；无启用基线时返回 409。"""
+    baseline = db.get_active_baseline(equipment_id)
+    if baseline is None:
+        raise ApiError(409, "NO_ACTIVE_BASELINE",
+                       f"设备 {equipment_id} 当前没有处于启用状态的基线，请先创建或启用基线")
+    return compare_with_baseline(baseline["baseline_id"], req)
 
 
 # ---------- 告警管理 ----------

@@ -6,6 +6,8 @@
 
 还提供**频谱诊断**：以已有采样记录为输入，去直流并加 Hann 窗后做单边 FFT，给出频率分辨率、主峰频率与幅值；按录入的恒定转速把频谱换算为阶次并汇总用户指定阶次带的能量占比；提供轴承几何参数时推导 BPFO / BPFI / BSF / FTF，按特征频带能量占比阈值判定 `normal` / `attention` / `critical` 并给出命中依据；时域指标正常但特定频率存在稳定能量峰的场景由此可见线索。
 
+最后提供**基线对比**：检修后的泵重新上线时，用同一设备多条已保存频谱诊断及其源分析记录，按转速分组统计 RMS、峰值因子、主峰频率、峰值阶次的中位数与离散范围，生成带版本、来源 ID 与生效时间的基线；新诊断相对基线给出各指标偏差、变化率与关注/严重等级，帮助维护人员区分“负载差异导致的同工况正常波动”与“设备状态漂移”。
+
 ## 运行
 
 ```bash
@@ -28,6 +30,13 @@ uvicorn app.main:app --port 8000
 | POST | `/api/v1/spectrum/diagnoses` | 以已有记录为输入做频谱/阶次/轴承诊断并保存 |
 | GET | `/api/v1/spectrum/diagnoses` | 频谱诊断查询（`equipment_id` / `start_time` / `end_time` / 分页） |
 | GET | `/api/v1/spectrum/diagnoses/{id}` | 频谱诊断详情（谱指标、阶次带、轴承特征频带与命中依据） |
+| POST | `/api/v1/baselines/{equipment_id}` | 按转速分组构建设备振动基线（版本自增） |
+| GET | `/api/v1/baselines` | 基线查询（`equipment_id` / `status` / 分页） |
+| GET | `/api/v1/baselines/{id}` | 基线详情（分组统计、来源 ID、审计事件流） |
+| POST | `/api/v1/baselines/{id}/activate` | 启用基线（同设备旧启用基线自动变为 superseded） |
+| POST | `/api/v1/baselines/{id}/deactivate` | 停用基线 |
+| POST | `/api/v1/baselines/{id}/compare` | 指定基线对新诊断做偏差/变化率/等级对比 |
+| POST | `/api/v1/equipment/{equipment_id}/baseline-compare` | 便捷入口：用设备当前启用基线对比 |
 | GET | `/api/v1/alarms` | 告警查询（`equipment_id` / `status` / `severity` / 分页） |
 | GET | `/api/v1/alarms/{id}` | 告警详情（含操作事件流） |
 | POST | `/api/v1/alarms/{id}/acknowledge` | 确认告警（交班，记录操作者） |
@@ -97,6 +106,41 @@ POST /api/v1/spectrum/diagnoses
 - 三个阈值可随设备阈值配置（`bearing_*` 字段，对老调用方为可选），也可在请求中用 `bearing_attention_ratio` / `bearing_critical_ratio` / `bearing_band_tolerance` 临时覆盖。
 - 诊断结果持久化，`GET /api/v1/spectrum/diagnoses` 支持按 `equipment_id` 与创建时间范围 `start_time` / `end_time`（ISO 8601）筛选、分页；`GET .../{id}` 查看详情。
 
+## 振动基线与偏差对比
+
+```json
+POST /api/v1/baselines/PUMP-01
+{
+  "rpm_bins": [0, 1700, 3000],
+  "min_samples_per_group": 3,
+  "deviation_thresholds": {
+    "rms_attention": 0.15, "rms_critical": 0.30,
+    "main_peak_frequency_attention": 0.05, "main_peak_frequency_critical": 0.10
+  },
+  "effective_from": "2026-09-14T08:00:00+00:00",
+  "operator": "li.si",
+  "note": "大修后稳定运行一周构建"
+}
+```
+
+- **来源**：默认取该设备全部已保存频谱诊断（`spectrum_diagnoses` 与其源分析记录 `analysis_records` JOIN 得到指标），可用 `source_diagnosis_ids` 显式指定（任一 ID 不存在或属于其他设备返回 `404 DIAGNOSIS_NOT_FOUND`），或用 `start_time` / `end_time` 按诊断创建时间过滤。
+- **转速分组**：传 `rpm_bins` 时按左闭右开区间归组（与时间窗分析一致），诊断转速超出覆盖范围返回 `400 RPM_OUT_OF_BINS`；不传时按完全相同的 `rpm` 精确归组。每组分别统计 **RMS、峰值因子（取自源分析记录）、主峰频率（Hz）、峰值阶次（取自诊断 order.peak_order）** 的 `median`（中位数）与 `min` / `max`（离散范围），并记录每组的 `source_diagnosis_ids`。
+- **样本数门槛**：每组诊断条数少于 `min_samples_per_group`（默认 3）时跳过该组并在响应 `skipped_groups` 中说明；没有任何组达标返回 `400 INSUFFICIENT_BASELINE_SAMPLES`（details 含被跳过的分组）。
+- **版本与状态**：同一设备版本号从 1 自增；新建基线默认 `active`，设备上原有 active 基线自动变为 `superseded`。可通过 activate / deactivate 接口切换（重复操作返回 409），启用旧版本时当前 active 版本同样被置为 superseded。基线带 `effective_from`（缺省取当前 UTC）、`note`、`created_by`，所有创建/启用/停用操作连同操作者、备注与详情写入 `baseline_audit_events`，随基线详情返回完整事件流。
+- **偏差阈值**：按指标配置相对偏差 `|新值 − 中位数| / |中位数|` 的关注线 / 严重线，默认 RMS 15%/30%、峰值因子 20%/40%、主峰频率与峰值阶次 5%/10%，attention 必须小于 critical（否则 422）。对比请求中可用 `deviation_thresholds` 临时覆盖，不修改已保存基线。
+
+```json
+POST /api/v1/baselines/3/compare
+{"diagnosis_id": 42}
+
+POST /api/v1/equipment/PUMP-01/baseline-compare
+{"diagnosis_id": 42}
+```
+
+- 对比前按新诊断的转速匹配基线转速分组（精确组按相同转速，区间组按左闭右开）；基线未覆盖该转速返回 `400 BASELINE_RPM_NOT_COVERED`，跨设备对比返回 `400 BASELINE_EQUIPMENT_MISMATCH`，设备没有启用基线而使用便捷入口时返回 `409 NO_ACTIVE_BASELINE`。
+- 逐指标返回 `value` / `baseline_median` / `baseline_min` / `baseline_max`、带符号的 `deviation`（绝对偏差）与 `change_rate`（相对变化率，上升为正）、`within_dispersion`（是否落在历史离散范围内）、命中的阈值与中文 `message`；`overall_level` 取四项指标的最高等级。中位数为 0 时变化率无法计算（返回 `null`），该项按 normal 处理并在 message 中说明。
+- 直接对停用 / 被取代基线调用 compare 仍然可用，响应中以 `baseline_status` 标明其当前状态；对比结果不落库（基线本身及其审计留痕持久化）。
+
 ## 告警交班与留痕
 
 - 告警初始 `status=open`，确认后变为 `acknowledged`，记录 `acknowledged_by` / `acknowledged_at`；重复确认返回 `409 ALARM_ALREADY_ACKNOWLEDGED`，已确认告警仍可追加备注。
@@ -134,7 +178,13 @@ POST /api/v1/alarms/12/acknowledge
 | 阶次带/特征频带越过奈奎斯特频率或边界非法 | 400 | `BAND_OUT_OF_RANGE` / `INVALID_FREQUENCY_BAND` |
 | 查询时间范围格式非法或起止颠倒 | 400 | `INVALID_TIME_RANGE` |
 | 告警重复确认 | 409 | `ALARM_ALREADY_ACKNOWLEDGED` |
-| 记录 / 阈值 / 告警 / 频谱诊断不存在 | 404 | `RECORD_NOT_FOUND` / `THRESHOLD_NOT_FOUND` / `ALARM_NOT_FOUND` / `DIAGNOSIS_NOT_FOUND` |
+| 基线诊断转速超出 `rpm_bins` 覆盖范围 | 400 | `RPM_OUT_OF_BINS` |
+| 基线无分组 / 无任何分组达到最少诊断条数 | 400 | `INSUFFICIENT_BASELINE_SAMPLES` |
+| 基线未覆盖待对比诊断的转速 | 400 | `BASELINE_RPM_NOT_COVERED` |
+| 诊断与基线不属于同一设备 | 400 | `BASELINE_EQUIPMENT_MISMATCH` |
+| 重复启用 / 停用基线 | 409 | `BASELINE_ALREADY_ACTIVE` / `BASELINE_ALREADY_INACTIVE` |
+| 设备没有启用基线时走便捷对比入口 | 409 | `NO_ACTIVE_BASELINE` |
+| 记录 / 阈值 / 告警 / 频谱诊断 / 基线不存在 | 404 | `RECORD_NOT_FOUND` / `THRESHOLD_NOT_FOUND` / `ALARM_NOT_FOUND` / `DIAGNOSIS_NOT_FOUND` / `BASELINE_NOT_FOUND` |
 
 ## 测试
 
